@@ -1,6 +1,6 @@
 //! MCP front end: JSON-RPC 2.0 over HTTP POST, exposing `search` and `read_document`.
 
-use crate::app::{App, AppError, SearchRequest, MAX_K, MAX_QUERY_CHARS};
+use crate::app::{App, AppError, SearchRequest, MAX_K, MAX_PATH_CHARS, MAX_QUERY_CHARS};
 use axum::{http::StatusCode, response::IntoResponse, response::Response, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -8,7 +8,6 @@ use std::sync::Arc;
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const SEARCH_TEXT_CHARS: usize = 900;
 const DOCUMENT_CHARS: usize = 50_000;
-const DEFAULT_TOOL_K: u64 = 5;
 
 pub async fn handle(app: &Arc<App>, body: Option<Json<Value>>) -> Response {
     let Some(Json(req)) = body else {
@@ -90,7 +89,7 @@ fn tools() -> Value {
             "description": "Read one indexed document in full by its path, as cited by search (the .md suffix is optional).",
             "inputSchema": {
                 "type": "object",
-                "properties": { "path": { "type": "string", "minLength": 1, "maxLength": 400 } },
+                "properties": { "path": { "type": "string", "minLength": 1, "maxLength": MAX_PATH_CHARS } },
                 "required": ["path"],
                 "additionalProperties": false
             }
@@ -103,15 +102,16 @@ async fn search(app: &Arc<App>, args: &Value) -> Result<String, AppError> {
         .as_str()
         .ok_or_else(|| AppError::BadRequest("query must be a string".into()))?;
     let k = match &args["k"] {
-        Value::Null => DEFAULT_TOOL_K,
-        v => v
-            .as_u64()
-            .ok_or_else(|| AppError::BadRequest("k must be a positive integer".into()))?,
+        Value::Null => None,
+        v => Some(
+            v.as_u64()
+                .ok_or_else(|| AppError::BadRequest("k must be a positive integer".into()))?,
+        ),
     };
     let hits = app
         .search(SearchRequest {
             query: query.to_string(),
-            k: Some(k),
+            k,
             ..Default::default()
         })
         .await?;

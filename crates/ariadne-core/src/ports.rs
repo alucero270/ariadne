@@ -3,7 +3,8 @@
 
 use anyhow::Result;
 
-/// Turns text into vectors. Implementations return one unit-length vector per input, in order.
+/// Turns text into vectors: one per input, in order. The index normalizes them and rejects a
+/// wrong count, so implementations need not.
 pub trait Embedder: Send {
     /// Stable identity, stored with the index. A different name forces a full re-embed.
     fn name(&self) -> String;
@@ -23,7 +24,7 @@ pub struct Models {
     pub reranker: Option<Box<dyn Reranker>>,
 }
 
-pub fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+pub(crate) fn normalize(mut v: Vec<f32>) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
         v.iter_mut().for_each(|x| *x /= norm);

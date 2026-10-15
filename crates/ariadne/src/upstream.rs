@@ -2,7 +2,6 @@
 //! `/v1/rerank`, such as llama-swap serves.
 
 use anyhow::{anyhow, Context, Result};
-use ariadne_core::ports::normalize;
 use ariadne_core::{Embedder, Reranker};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -83,7 +82,7 @@ impl Embedder for HttpEmbedder {
                     .iter()
                     .map(|x| x.as_f64().unwrap_or(0.0) as f32)
                     .collect();
-                out.push(normalize(v));
+                out.push(v);
             }
         }
         Ok(out)
@@ -217,7 +216,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedder_batches_orders_normalizes_and_authenticates() {
+    fn embedder_batches_orders_and_authenticates() {
         let (url, seen) = serve(|_, body| {
             let n = body["input"].as_array().unwrap().len();
             let data: Vec<_> = (0..n)
@@ -229,10 +228,8 @@ mod tests {
         let mut e = HttpEmbedder::new(&format!("{url}/"), "m", "LOCAL");
         e.batch_size = 2;
         let vecs = e.embed(&["a".into(), "b".into(), "c".into()]).unwrap();
-        assert_eq!(vecs.len(), 3);
-        assert!(vecs
-            .iter()
-            .all(|v| ((v[0] * v[0] + v[1] * v[1]) - 1.0).abs() < 1e-6));
+        // Each batch restarts at index 0; replies arrive reversed and are put back in order.
+        assert_eq!(vecs, vec![vec![1.0, 0.0], vec![2.0, 0.0], vec![1.0, 0.0]]);
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert!(seen
