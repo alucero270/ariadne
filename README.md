@@ -14,6 +14,8 @@
 > ./target/release/ariadne --root ~/notes --db ariadne.db serve
 > # add embeddings from any OpenAI-compatible endpoint, e.g. llama-swap
 > ./target/release/ariadne --embed-url http://127.0.0.1:8085 --embed-model bge-m3-embed ...
+> # contextual chunks: a chat model writes a context per chunk at index time (cached)
+> ./target/release/ariadne --context-url http://127.0.0.1:8085 --context-model <chat model> ...
 > ```
 >
 > Endpoints: `GET /health`, `GET /search?q=&k=&mode=hybrid|bm25|dense` (`k` from 1 to 20, default 5 on every

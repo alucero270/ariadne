@@ -4,7 +4,7 @@
 //! One writer and any number of readers may open the same database at once. Readers keep
 //! answering while a writer rebuilds, and pick up the new data once the rebuild commits.
 
-use crate::chunk::{chunk_markdown, reference};
+use crate::chunk::{chunk_markdown, reference, Chunk};
 use crate::ports::{normalize, Embedder, Models};
 use crate::rank::{cap_per_key, fts_query, fuse};
 use crate::source::{resolve_inside, walk_markdown, DEFAULT_EXCLUDES};
@@ -15,6 +15,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// What to index: a root folder (read-only), the paths under it to skip, and the largest chunk
@@ -156,10 +158,36 @@ pub struct Hit {
     pub title: String,
     pub heading: String,
     pub text: String,
+    /// LLM-written context for this chunk, when the index has a contextualizer.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub context: String,
     pub score: f64,
     /// 1-based rank from each retriever that found this chunk.
     pub ranks: HashMap<String, usize>,
 }
+
+/// A document whose content changed since the last build, read and chunked.
+struct ChangedDocument {
+    path: String,
+    sha: String,
+    text: String,
+    chunks: Vec<Chunk>,
+}
+
+/// A chunk still waiting for its context.
+struct PendingContext {
+    document: usize,
+    chunk: usize,
+    key: String,
+}
+
+struct DocumentVectors {
+    per_document: Vec<Option<Vec<Vec<f32>>>>,
+    dimensions: Option<usize>,
+}
+
+/// Longest context kept, in characters. Contexts are meant to be a sentence or two.
+const MAX_CONTEXT_CHARS: usize = 600;
 
 /// Vectors held in memory for dense search, tagged with the database version they came from.
 struct VectorCache {
@@ -194,13 +222,14 @@ impl Index {
     }
 
     /// Bring the index up to date with the source. Unchanged files are skipped; a different
-    /// embedder, chunk size, or root rebuilds everything.
+    /// embedder, contextualizer, chunk size, or root rebuilds everything.
     pub fn build(&mut self) -> Result<BuildStats> {
         let start = Instant::now();
         let root = self.source.root.canonicalize()?;
         let files = walk_markdown(&root, &self.source.excludes)?;
         let settings = [
             ("embedder", self.embedder_name()),
+            ("contextualizer", self.contextualizer_name()),
             ("max_chars", self.source.max_chars.to_string()),
             ("root", root.to_string_lossy().into_owned()),
         ];
@@ -208,36 +237,156 @@ impl Index {
         for (key, value) in &settings {
             full |= store::meta(&self.conn, key)?.as_deref() != Some(value.as_str());
         }
-
-        let tx = self.conn.transaction()?;
-        if full {
-            store::clear(&tx)?;
-        }
-        let known = store::file_hashes(&tx)?;
-        let mut dimensions: Option<usize> = match full {
-            true => None,
-            false => store::meta(&tx, "dimensions")?.and_then(|d| d.parse().ok()),
+        let known = match full {
+            true => HashMap::new(),
+            false => store::file_hashes(&self.conn)?,
         };
         let mut stats = BuildStats {
             files_seen: files.len(),
             ..Default::default()
         };
+
+        // Read and chunk changed documents. No write lock is held until the last step.
+        let mut changed = Vec::new();
         let mut seen = HashSet::new();
         for file in &files {
-            seen.insert(file.rel.as_str());
+            seen.insert(file.rel.clone());
             let raw = std::fs::read(&file.abs)?;
             let sha = format!("{:x}", Sha256::digest(&raw));
             if known.get(&file.rel) == Some(&sha) {
                 continue;
             }
-            let chunks = chunk_markdown(
-                &file.rel,
-                &String::from_utf8_lossy(&raw),
-                self.source.max_chars,
-            );
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let chunks = chunk_markdown(&file.rel, &text, self.source.max_chars);
+            changed.push(ChangedDocument {
+                path: file.rel.clone(),
+                sha,
+                text,
+                chunks,
+            });
+        }
+
+        self.add_contexts(&mut changed)?;
+        let vectors = self.embed_documents(&changed, full)?;
+
+        let tx = self.conn.transaction()?;
+        if full {
+            store::clear(&tx)?;
+        }
+        for (doc, doc_vectors) in changed.iter().zip(&vectors.per_document) {
+            store::write_file(
+                &tx,
+                &doc.path,
+                &doc.sha,
+                &doc.chunks,
+                doc_vectors.as_deref(),
+            )?;
+            stats.files_changed += 1;
+            stats.chunks_written += doc.chunks.len();
+        }
+        for gone in known.keys().filter(|p| !seen.contains(*p)) {
+            store::delete_file(&tx, gone)?;
+            stats.files_removed += 1;
+        }
+        for (key, value) in &settings {
+            store::set_meta(&tx, key, value)?;
+        }
+        if let Some(d) = vectors.dimensions {
+            store::set_meta(&tx, "dimensions", &d.to_string())?;
+        }
+        store::set_meta(&tx, "indexed_at", &now_utc())?;
+        tx.commit()?;
+        self.cache = None;
+        stats.seconds = (start.elapsed().as_secs_f64() * 100.0).round() / 100.0;
+        Ok(stats)
+    }
+
+    /// Give each chunk its context: from the cache when this contextualizer has already
+    /// described identical text, otherwise from the contextualizer, several at a time. Every new
+    /// context is cached as soon as it arrives, so an interrupted build loses no finished work.
+    fn add_contexts(&self, docs: &mut [ChangedDocument]) -> Result<()> {
+        let Some(contextualizer) = &self.models.contextualizer else {
+            return Ok(());
+        };
+        let name = contextualizer.name();
+        let mut pending = Vec::new();
+        for (d, doc) in docs.iter_mut().enumerate() {
+            for (c, chunk) in doc.chunks.iter_mut().enumerate() {
+                let key = context_key(&name, &chunk.embed_text());
+                match store::cached_context(&self.conn, &key)? {
+                    Some(context) => chunk.context = context,
+                    None => pending.push(PendingContext {
+                        document: d,
+                        chunk: c,
+                        key,
+                    }),
+                }
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let workers = contextualizer.parallelism().clamp(1, 32).min(pending.len());
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let mut contexts: Vec<Option<String>> = vec![None; pending.len()];
+        let mut failure: Option<anyhow::Error> = None;
+        {
+            let (pending, next, stop, docs) = (&pending, &next, &stop, &*docs);
+            let (sender, receiver) = mpsc::channel::<(usize, Result<String>)>();
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let sender = sender.clone();
+                    scope.spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(job) = pending.get(i) else { break };
+                            let doc = &docs[job.document];
+                            let described = contextualizer
+                                .describe(&doc.text, &doc.chunks[job.chunk].embed_text());
+                            if sender.send((i, described)).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                drop(sender);
+                for (i, described) in receiver {
+                    let saved = described.and_then(clean_context).and_then(|context| {
+                        store::cache_context(&self.conn, &pending[i].key, &context)?;
+                        Ok(context)
+                    });
+                    match saved {
+                        Ok(context) => contexts[i] = Some(context),
+                        Err(e) => {
+                            stop.store(true, Ordering::Relaxed);
+                            failure.get_or_insert(e);
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(e) = failure {
+            return Err(e.context(format!("contextualizer {name} failed")));
+        }
+        for (job, context) in pending.iter().zip(contexts) {
+            docs[job.document].chunks[job.chunk].context =
+                context.expect("every job finished without a failure");
+        }
+        Ok(())
+    }
+
+    fn embed_documents(&self, docs: &[ChangedDocument], full: bool) -> Result<DocumentVectors> {
+        let mut dimensions: Option<usize> = match full {
+            true => None,
+            false => store::meta(&self.conn, "dimensions")?.and_then(|d| d.parse().ok()),
+        };
+        let mut per_document = Vec::with_capacity(docs.len());
+        for doc in docs {
             let vectors = match &self.models.embedder {
-                Some(e) if !chunks.is_empty() => {
-                    let texts: Vec<String> = chunks.iter().map(|c| c.embed_text()).collect();
+                Some(e) if !doc.chunks.is_empty() => {
+                    let texts: Vec<String> = doc.chunks.iter().map(|c| c.embed_text()).collect();
                     Some(embed_checked(e.as_ref(), &texts)?)
                 }
                 _ => None,
@@ -253,25 +402,20 @@ impl Index {
                     Some(_) => {}
                 }
             }
-            store::write_file(&tx, &file.rel, &sha, &chunks, vectors.as_deref())?;
-            stats.files_changed += 1;
-            stats.chunks_written += chunks.len();
+            per_document.push(vectors);
         }
-        for gone in known.keys().filter(|p| !seen.contains(p.as_str())) {
-            store::delete_file(&tx, gone)?;
-            stats.files_removed += 1;
-        }
-        for (key, value) in &settings {
-            store::set_meta(&tx, key, value)?;
-        }
-        if let Some(d) = dimensions {
-            store::set_meta(&tx, "dimensions", &d.to_string())?;
-        }
-        store::set_meta(&tx, "indexed_at", &now_utc())?;
-        tx.commit()?;
-        self.cache = None;
-        stats.seconds = (start.elapsed().as_secs_f64() * 100.0).round() / 100.0;
-        Ok(stats)
+        Ok(DocumentVectors {
+            per_document,
+            dimensions,
+        })
+    }
+
+    fn contextualizer_name(&self) -> String {
+        self.models
+            .contextualizer
+            .as_ref()
+            .map(|c| c.name())
+            .unwrap_or_else(|| "none".into())
     }
 
     pub(crate) fn has_embedder(&self) -> bool {
@@ -415,6 +559,7 @@ impl Index {
             title: c.title,
             heading: c.heading,
             text: c.body,
+            context: c.context,
             score,
             ranks,
         })
@@ -438,6 +583,28 @@ impl Index {
         hits.sort_by(|a, b| b.score.total_cmp(&a.score));
         Ok(())
     }
+}
+
+/// Cache key: the contextualizer and the exact text it describes. Editing one section of a
+/// document re-describes only that section.
+fn context_key(contextualizer: &str, chunk_text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(contextualizer.as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk_text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Collapse whitespace, cap the length, and refuse an empty answer.
+fn clean_context(raw: String) -> Result<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        bail!("contextualizer returned an empty context");
+    }
+    Ok(match collapsed.char_indices().nth(MAX_CONTEXT_CHARS) {
+        Some((i, _)) => collapsed[..i].to_string(),
+        None => collapsed,
+    })
 }
 
 /// Hold the `Embedder` contract here rather than trusting each adapter: one vector per input,
@@ -537,6 +704,7 @@ pub(crate) mod tests {
             let models = Models {
                 embedder: embedder.then(|| Box::new(HashEmbedder) as Box<dyn Embedder>),
                 reranker: None,
+                contextualizer: None,
             };
             self.open_with(models)
         }
@@ -660,6 +828,7 @@ pub(crate) mod tests {
         let mut idx = f.open_with(Models {
             embedder: Some(Box::new(HashEmbedder)),
             reranker: Some(Box::new(ReverseReranker)),
+            contextualizer: None,
         });
         idx.build().unwrap();
         let base = SearchOptions {
@@ -737,6 +906,7 @@ pub(crate) mod tests {
         let mut resized = f.open_with(Models {
             embedder: Some(Box::new(ResizedEmbedder)),
             reranker: None,
+            contextualizer: None,
         });
         let err = resized
             .search("whisper", &opts(Mode::Dense, 1))
@@ -776,6 +946,7 @@ pub(crate) mod tests {
         let mut unnormalized = f.open_with(Models {
             embedder: Some(Box::new(SloppyEmbedder { short: false })),
             reranker: None,
+            contextualizer: None,
         });
         unnormalized.build().unwrap();
         let hits = unnormalized
@@ -790,9 +961,132 @@ pub(crate) mod tests {
         let mut short = g.open_with(Models {
             embedder: Some(Box::new(SloppyEmbedder { short: true })),
             reranker: None,
+            contextualizer: None,
         });
         let err = short.build().unwrap_err();
         assert!(err.to_string().contains("returned"), "{err}");
+    }
+
+    /// Adds a word no document contains, counts calls, and fails on request.
+    struct FakeContextualizer {
+        name: &'static str,
+        calls: std::sync::Arc<AtomicUsize>,
+        fail_on: Option<&'static str>,
+    }
+
+    impl FakeContextualizer {
+        fn new(name: &'static str) -> (Self, std::sync::Arc<AtomicUsize>) {
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let fake = Self {
+                name,
+                calls: calls.clone(),
+                fail_on: None,
+            };
+            (fake, calls)
+        }
+    }
+
+    impl crate::ports::Contextualizer for FakeContextualizer {
+        fn name(&self) -> String {
+            self.name.into()
+        }
+        fn parallelism(&self) -> usize {
+            3
+        }
+        fn describe(&self, document: &str, chunk: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_on.is_some_and(|word| chunk.contains(word)) {
+                bail!("model unavailable");
+            }
+            let title = document
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("# ");
+            Ok(format!("  From {title}:\n  zebracrossing   context. "))
+        }
+    }
+
+    fn with_contexts(fake: FakeContextualizer, embedder: bool) -> Models {
+        Models {
+            embedder: embedder.then(|| Box::new(HashEmbedder) as Box<dyn Embedder>),
+            reranker: None,
+            contextualizer: Some(Box::new(fake)),
+        }
+    }
+
+    #[test]
+    fn generated_context_is_searchable_and_returned() {
+        let f = Fixture::new();
+        let (fake, calls) = FakeContextualizer::new("ctx-a");
+        let mut idx = f.open_with(with_contexts(fake, false));
+        idx.build().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let hits = idx.search("zebracrossing", &opts(Mode::Bm25, 10)).unwrap();
+        assert_eq!(hits.len(), 3, "four chunks, at most two per document");
+        let qidi = hits.iter().find(|h| h.path.contains("qidi")).unwrap();
+        assert_eq!(qidi.context, "From Qidi Plus 4: zebracrossing context.");
+    }
+
+    #[test]
+    fn contexts_are_cached_across_rebuilds_and_edits() {
+        let f = Fixture::new();
+        let (fake, calls) = FakeContextualizer::new("ctx-a");
+        f.open_with(with_contexts(fake, false)).build().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // Adding an embedder forces a full rebuild; every context comes from the cache.
+        let (fake, calls) = FakeContextualizer::new("ctx-a");
+        let mut idx = f.open_with(with_contexts(fake, true));
+        assert_eq!(idx.build().unwrap().files_changed, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        f.write(
+            "voice.md",
+            &format!("{VOICE}\n## Barge-in\n\nInterruptions are supported.\n"),
+        );
+        idx.build().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the new section is described"
+        );
+    }
+
+    #[test]
+    fn changing_the_contextualizer_rebuilds() {
+        let f = Fixture::new();
+        f.open_with(with_contexts(FakeContextualizer::new("ctx-a").0, false))
+            .build()
+            .unwrap();
+        let (fake, calls) = FakeContextualizer::new("ctx-b");
+        let mut idx = f.open_with(with_contexts(fake, false));
+        assert_eq!(idx.build().unwrap().files_changed, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let mut none = f.open(false);
+        assert_eq!(none.build().unwrap().files_changed, 2);
+        assert!(none
+            .search("zebracrossing", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_failed_description_keeps_the_index_and_finished_work() {
+        let f = Fixture::new();
+        let (mut fake, _) = FakeContextualizer::new("ctx-a");
+        fake.fail_on = Some("Firewall");
+        let mut idx = f.open_with(with_contexts(fake, false));
+        let err = idx.build().unwrap_err();
+        assert!(format!("{err:#}").contains("model unavailable"), "{err:#}");
+        assert_eq!(idx.stats().unwrap().files, 0, "nothing written");
+
+        let (fake, calls) = FakeContextualizer::new("ctx-a");
+        f.open_with(with_contexts(fake, false)).build().unwrap();
+        assert!(
+            calls.load(Ordering::SeqCst) < 4,
+            "contexts finished before the failure were cached"
+        );
     }
 
     #[test]

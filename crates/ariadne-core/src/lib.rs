@@ -13,4 +13,4 @@ mod store;
 
 pub use eval::{EvalReport, EvalSet, ModeScore, Question};
 pub use index::{BuildStats, Hit, Index, IndexStats, Mode, SearchOptions, Source};
-pub use ports::{Embedder, Models, Reranker};
+pub use ports::{Contextualizer, Embedder, Models, Reranker};

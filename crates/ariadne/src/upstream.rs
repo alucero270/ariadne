@@ -2,7 +2,7 @@
 //! `/v1/rerank`, such as llama-swap serves.
 
 use anyhow::{anyhow, Context, Result};
-use ariadne_core::{Embedder, Reranker};
+use ariadne_core::{Contextualizer, Embedder, Reranker};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -145,6 +145,85 @@ impl Reranker for HttpReranker {
     }
 }
 
+/// Writes chunk contexts with any OpenAI-compatible `/v1/chat/completions` endpoint, using the
+/// prompt from Anthropic's contextual retrieval write-up.
+pub struct HttpContextualizer {
+    url: String,
+    model: String,
+    api_key: String,
+    workers: usize,
+    max_document_chars: usize,
+    agent: ureq::Agent,
+}
+
+impl HttpContextualizer {
+    pub fn new(base_url: &str, model: &str, api_key: &str, workers: usize) -> Self {
+        Self {
+            url: format!("{}/v1/chat/completions", base_url.trim_end_matches('/')),
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            workers,
+            max_document_chars: 12_000,
+            agent: agent(Duration::from_secs(180)),
+        }
+    }
+
+    fn prompt(&self, document: &str, chunk: &str) -> String {
+        let document: String = document.chars().take(self.max_document_chars).collect();
+        format!(
+            "<document>\n{document}\n</document>\n\
+             Here is the chunk we want to situate within the whole document\n\
+             <chunk>\n{chunk}\n</chunk>\n\
+             Please give a short succinct context to situate this chunk within the overall \
+             document for the purposes of improving search retrieval of the chunk. Answer only \
+             with the succinct context and nothing else."
+        )
+    }
+}
+
+impl Contextualizer for HttpContextualizer {
+    fn name(&self) -> String {
+        format!("chat:{}", self.model)
+    }
+
+    fn parallelism(&self) -> usize {
+        self.workers
+    }
+
+    fn describe(&self, document: &str, chunk: &str) -> Result<String> {
+        let body = post(
+            &self.agent,
+            &self.url,
+            &self.api_key,
+            json!({
+                "model": self.model,
+                "messages": [{"role": "user", "content": self.prompt(document, chunk)}],
+                "max_tokens": 200,
+                "temperature": 0
+            }),
+        )?;
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| anyhow!("chat response has no message content"))?;
+        Ok(strip_think(content))
+    }
+}
+
+/// Reasoning models may wrap their thinking in <think> tags; keep only the answer.
+fn strip_think(text: &str) -> String {
+    let mut out = text.to_string();
+    while let (Some(start), Some(end)) = (out.find("<think>"), out.find("</think>")) {
+        if end < start {
+            break;
+        }
+        out.replace_range(start..end + "</think>".len(), "");
+    }
+    if let Some(start) = out.find("<think>") {
+        out.truncate(start);
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -243,6 +322,38 @@ mod tests {
         assert!(HttpEmbedder::new(&url, "m", "")
             .embed(&["a".into(), "b".into()])
             .is_err());
+    }
+
+    #[test]
+    fn contextualizer_sends_document_and_chunk_and_strips_thinking() {
+        let (url, seen) = serve(
+            |_, _| json!({"choices": [{"message": {"content": "<think>hmm</think> About the printer."}}]}),
+        );
+        let c = HttpContextualizer::new(&url, "small", "LOCAL", 4);
+        let context = c.describe("# Qidi\n\nwhole doc", "the chunk").unwrap();
+        assert_eq!(context, "About the printer.");
+        assert_eq!((c.name(), c.parallelism()), ("chat:small".to_string(), 4));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0, "/v1/chat/completions");
+        assert_eq!(seen[0].1, "Bearer LOCAL");
+        let body: serde_json::Value = serde_json::from_str(&seen[0].2).unwrap();
+        let prompt = body["messages"][0]["content"].as_str().unwrap();
+        assert!(prompt.contains("whole doc") && prompt.contains("<chunk>\nthe chunk\n</chunk>"));
+    }
+
+    #[test]
+    fn contextualizer_rejects_a_reply_without_content() {
+        let (url, _) = serve(|_, _| json!({"choices": []}));
+        assert!(HttpContextualizer::new(&url, "m", "", 1)
+            .describe("d", "c")
+            .is_err());
+    }
+
+    #[test]
+    fn strip_think_handles_closed_and_unclosed_blocks() {
+        assert_eq!(strip_think("<think>a</think>Answer"), "Answer");
+        assert_eq!(strip_think("Answer<think>never closed"), "Answer");
+        assert_eq!(strip_think("plain"), "plain");
     }
 
     #[test]
