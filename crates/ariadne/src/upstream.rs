@@ -120,18 +120,28 @@ impl Reranker for HttpReranker {
             &self.api_key,
             json!({"model": self.model, "query": query, "documents": documents}),
         )?;
-        let mut scores = vec![0.0f32; documents.len()];
-        for r in body["results"]
+        let mut scores: Vec<Option<f32>> = vec![None; documents.len()];
+        let results = body["results"]
             .as_array()
-            .ok_or_else(|| anyhow!("rerank response has no results"))?
-        {
+            .ok_or_else(|| anyhow!("rerank response has no results"))?;
+        for r in results {
             let i = r["index"]
                 .as_u64()
-                .ok_or_else(|| anyhow!("rerank result has no index"))? as usize;
-            if let Some(slot) = scores.get_mut(i) {
-                *slot = r["relevance_score"].as_f64().unwrap_or(0.0) as f32;
-            }
+                .and_then(|i| usize::try_from(i).ok())
+                .filter(|i| *i < documents.len())
+                .ok_or_else(|| anyhow!("rerank result has a missing or out-of-range index"))?;
+            let score = r["relevance_score"]
+                .as_f64()
+                .ok_or_else(|| anyhow!("rerank result {i} has no relevance_score"))?;
+            scores[i] = Some(score as f32);
         }
+        let scores: Option<Vec<f32>> = scores.into_iter().collect();
+        let scores = scores.ok_or_else(|| {
+            anyhow!(
+                "rerank response scored only some of the {} documents",
+                documents.len()
+            )
+        })?;
         Ok(scores)
     }
 }
@@ -236,6 +246,20 @@ mod tests {
         assert!(HttpEmbedder::new(&url, "m", "")
             .embed(&["a".into(), "b".into()])
             .is_err());
+    }
+
+    #[test]
+    fn reranker_rejects_partial_or_malformed_replies() {
+        for reply in [
+            json!({"results": [{"index": 0, "relevance_score": 0.5}]}),
+            json!({"results": [{"index": 0, "relevance_score": 0.5}, {"index": 5, "relevance_score": 0.1}]}),
+            json!({"results": [{"index": 0}, {"index": 1, "relevance_score": 0.1}]}),
+        ] {
+            let (url, _) = serve(move |_, _| reply.clone());
+            assert!(HttpReranker::new(&url, "r", "")
+                .rerank("q", &["x".into(), "y".into()])
+                .is_err());
+        }
     }
 
     #[test]

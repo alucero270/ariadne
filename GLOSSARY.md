@@ -24,7 +24,8 @@ different embedder, chunk size, or source root rebuilds everything.
 retriever that found it.
 
 **Retriever**: one way of finding chunks: **keyword** (BM25 over full text) or **dense**
-(similarity of embedding vectors). **Hybrid** search fuses both.
+(similarity of embedding vectors). **Hybrid** search fuses both. In the API, the keyword
+retriever is named `bm25`, both as a `mode` and in each hit's `ranks`.
 
 **Models**: the optional AI behind the index: an **embedder** (text to vectors) and a
 **reranker** (rescores hits against the query). Without models, the index is keyword-only.

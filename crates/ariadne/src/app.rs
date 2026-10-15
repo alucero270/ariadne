@@ -6,7 +6,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 pub const MAX_K: u64 = 20;
-pub const DEFAULT_K: u64 = 8;
 pub const MAX_QUERY_CHARS: usize = 500;
 
 #[derive(Debug)]
@@ -45,7 +44,7 @@ impl SearchRequest {
                 "query must be 1 to {MAX_QUERY_CHARS} characters"
             )));
         }
-        let k = self.k.unwrap_or(DEFAULT_K);
+        let k = self.k.unwrap_or(SearchOptions::default().k as u64);
         if !(1..=MAX_K).contains(&k) {
             return Err(AppError::BadRequest(format!("k must be from 1 to {MAX_K}")));
         }
