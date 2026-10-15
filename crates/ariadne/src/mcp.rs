@@ -122,12 +122,16 @@ async fn search(app: &Arc<App>, args: &Value) -> Result<String, AppError> {
         .iter()
         .enumerate()
         .map(|(i, h)| {
-            format!(
-                "[{}] [[{}]]\n{}",
-                i + 1,
-                h.reference,
-                truncate_chars(&h.text, SEARCH_TEXT_CHARS)
-            )
+            let text = truncate_chars(&h.text, SEARCH_TEXT_CHARS);
+            match h.context.is_empty() {
+                true => format!("[{}] [[{}]]\n{text}", i + 1, h.reference),
+                false => format!(
+                    "[{}] [[{}]]\nContext: {}\n{text}",
+                    i + 1,
+                    h.reference,
+                    h.context
+                ),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n"))

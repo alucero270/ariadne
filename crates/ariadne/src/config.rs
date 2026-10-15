@@ -2,7 +2,7 @@
 //! them into a ready index or app.
 
 use crate::app::App;
-use crate::upstream::{HttpEmbedder, HttpReranker};
+use crate::upstream::{HttpContextualizer, HttpEmbedder, HttpReranker};
 use anyhow::{bail, Context, Result};
 use ariadne_core::{BuildStats, Index, Models, Source};
 use std::net::SocketAddr;
@@ -33,7 +33,16 @@ pub struct Settings {
     pub rerank_url: Option<String>,
     #[arg(long, env = "ARIADNE_RERANK_MODEL", global = true)]
     pub rerank_model: Option<String>,
-    /// Bearer token sent to the embedding and rerank endpoints.
+    /// OpenAI-compatible base URL for a chat model that writes a short context for each chunk at
+    /// index time (contextual retrieval). Unset disables it.
+    #[arg(long, env = "ARIADNE_CONTEXT_URL", global = true)]
+    pub context_url: Option<String>,
+    #[arg(long, env = "ARIADNE_CONTEXT_MODEL", global = true)]
+    pub context_model: Option<String>,
+    /// Chat requests in flight at once while indexing.
+    #[arg(long, env = "ARIADNE_CONTEXT_WORKERS", global = true)]
+    pub context_workers: Option<usize>,
+    /// Bearer token sent to the embedding, rerank, and context endpoints.
     #[arg(
         long,
         env = "ARIADNE_UPSTREAM_KEY",
@@ -61,6 +70,8 @@ pub struct Config {
     source: Source,
     embedder: Option<Endpoint>,
     reranker: Option<Endpoint>,
+    contextualizer: Option<Endpoint>,
+    context_workers: usize,
     upstream_key: String,
 }
 
@@ -79,6 +90,12 @@ impl Config {
             source,
             embedder: endpoint(settings.embed_url, settings.embed_model, "EMBED")?,
             reranker: endpoint(settings.rerank_url, settings.rerank_model, "RERANK")?,
+            contextualizer: endpoint(settings.context_url, settings.context_model, "CONTEXT")?,
+            context_workers: match settings.context_workers {
+                Some(n) if !(1..=32).contains(&n) => bail!("--context-workers must be 1 to 32"),
+                Some(n) => n,
+                None => 4,
+            },
             upstream_key: settings.upstream_key,
         })
     }
@@ -94,6 +111,14 @@ impl Config {
                 .reranker
                 .as_ref()
                 .map(|r| Box::new(HttpReranker::new(&r.url, &r.model, key)) as _),
+            contextualizer: self.contextualizer.as_ref().map(|c| {
+                Box::new(HttpContextualizer::new(
+                    &c.url,
+                    &c.model,
+                    key,
+                    self.context_workers,
+                )) as _
+            }),
         }
     }
 
@@ -156,6 +181,16 @@ mod tests {
         };
         let err = Config::new(half).unwrap_err().to_string();
         assert!(err.contains("ARIADNE_EMBED_URL"), "{err}");
+        let half_context = Settings {
+            context_model: Some("m".into()),
+            ..settings(Some("/tmp".into()), db.clone())
+        };
+        assert!(Config::new(half_context).is_err());
+        let too_many = Settings {
+            context_workers: Some(64),
+            ..settings(Some("/tmp".into()), db.clone())
+        };
+        assert!(Config::new(too_many).is_err());
         let tiny = Settings {
             max_chars: Some(10),
             ..settings(Some("/tmp".into()), db)

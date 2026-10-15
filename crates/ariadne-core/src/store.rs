@@ -7,6 +7,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
+/// Bump when the schema changes. An index at another version is dropped and rebuilt; it is
+/// derived data, so nothing is lost but time.
+const SCHEMA_VERSION: i64 = 2;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, sha TEXT NOT NULL);
@@ -18,10 +22,20 @@ CREATE TABLE IF NOT EXISTS chunks(
   anchor TEXT NOT NULL,
   ord INTEGER NOT NULL,
   body TEXT NOT NULL,
+  context TEXT NOT NULL DEFAULT '',
   vec BLOB
 );
 CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(context, body, tokenize='porter unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(location, context, body, tokenize='porter unicode61');
+CREATE TABLE IF NOT EXISTS contexts(key TEXT PRIMARY KEY, context TEXT NOT NULL);
+";
+
+const DROP_ALL: &str = "
+DROP TABLE IF EXISTS meta;
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS chunks;
+DROP TABLE IF EXISTS chunks_fts;
+DROP TABLE IF EXISTS contexts;
 ";
 
 /// A stored chunk as search needs it.
@@ -31,6 +45,7 @@ pub(crate) struct StoredChunk {
     pub heading: String,
     pub anchor: String,
     pub body: String,
+    pub context: String,
 }
 
 /// Open the database in WAL mode so one writer and many readers don't block each other.
@@ -38,6 +53,11 @@ pub(crate) fn open(db: &Path) -> Result<Connection> {
     let conn = Connection::open(db)?;
     conn.busy_timeout(Duration::from_secs(10))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != SCHEMA_VERSION {
+        conn.execute_batch(DROP_ALL)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
@@ -96,13 +116,18 @@ pub(crate) fn write_file(
     for (i, c) in chunks.iter().enumerate() {
         let blob = vectors.map(|v| to_blob(&v[i]));
         tx.execute(
-            "INSERT INTO chunks(path, title, heading, anchor, ord, body, vec) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![c.path, c.title, c.heading, c.anchor, c.ord as i64, c.body, blob],
+            "INSERT INTO chunks(path, title, heading, anchor, ord, body, context, vec) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![c.path, c.title, c.heading, c.anchor, c.ord as i64, c.body, c.context, blob],
         )?;
         let id = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO chunks_fts(rowid, context, body) VALUES (?1, ?2, ?3)",
-            params![id, format!("{} {} {}", c.title, c.heading, c.path), c.body],
+            "INSERT INTO chunks_fts(rowid, location, context, body) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                format!("{} {} {}", c.title, c.heading, c.path),
+                c.context,
+                c.body
+            ],
         )?;
     }
     tx.execute(
@@ -112,13 +137,15 @@ pub(crate) fn write_file(
     Ok(())
 }
 
-/// Chunk ids best-first by BM25, weighting the title/heading column 3x the body.
+/// Chunk ids best-first by BM25, weighting the title/heading/path column 3x the body and the
+/// generated context 2x. An empty context column adds nothing, so scores without a
+/// contextualizer are unchanged.
 pub(crate) fn keyword_ids(conn: &Connection, fts_query: &str, limit: usize) -> Result<Vec<i64>> {
     if fts_query.is_empty() {
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts, 3.0, 1.0) LIMIT ?2",
+        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts, 3.0, 2.0, 1.0) LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![fts_query, limit as i64], |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -138,7 +165,7 @@ pub(crate) fn vectors(conn: &Connection) -> Result<(Vec<i64>, Vec<Vec<f32>>)> {
 
 pub(crate) fn chunk(conn: &Connection, id: i64) -> Result<StoredChunk> {
     Ok(conn.query_row(
-        "SELECT path, title, heading, anchor, body FROM chunks WHERE id=?1",
+        "SELECT path, title, heading, anchor, body, context FROM chunks WHERE id=?1",
         [id],
         |r| {
             Ok(StoredChunk {
@@ -147,6 +174,7 @@ pub(crate) fn chunk(conn: &Connection, id: i64) -> Result<StoredChunk> {
                 heading: r.get(2)?,
                 anchor: r.get(3)?,
                 body: r.get(4)?,
+                context: r.get(5)?,
             })
         },
     )?)
@@ -155,6 +183,23 @@ pub(crate) fn chunk(conn: &Connection, id: i64) -> Result<StoredChunk> {
 /// Changes whenever another connection commits; stable across this connection's own writes.
 pub(crate) fn data_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
+}
+
+pub(crate) fn cached_context(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT context FROM contexts WHERE key=?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// Saved outside the build transaction on purpose: an interrupted build keeps its contexts.
+pub(crate) fn cache_context(conn: &Connection, key: &str, context: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO contexts(key, context) VALUES (?1, ?2)",
+        params![key, context],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn counts(conn: &Connection) -> Result<(i64, i64)> {

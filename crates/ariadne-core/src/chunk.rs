@@ -8,10 +8,12 @@ pub struct Chunk {
     pub anchor: String,
     pub ord: usize,
     pub body: String,
+    /// LLM-written text situating this chunk in its document; empty without a contextualizer.
+    pub context: String,
 }
 
 impl Chunk {
-    pub fn context(&self) -> String {
+    pub fn trail(&self) -> String {
         [self.title.as_str(), self.heading.as_str()]
             .iter()
             .filter(|s| !s.is_empty())
@@ -20,8 +22,13 @@ impl Chunk {
             .join(" > ")
     }
 
+    /// The text embedded for dense search, and given to the contextualizer as the chunk.
     pub fn embed_text(&self) -> String {
-        format!("{}\n\n{}", self.context(), self.body)
+        if self.context.is_empty() {
+            format!("{}\n\n{}", self.trail(), self.body)
+        } else {
+            format!("{}\n\n{}\n\n{}", self.context, self.trail(), self.body)
+        }
     }
 }
 
@@ -200,6 +207,7 @@ pub fn chunk_markdown(path: &str, text: &str, max_chars: usize) -> Vec<Chunk> {
                 anchor: anchor.clone(),
                 ord: chunks.len(),
                 body: piece,
+                context: String::new(),
             });
         }
     }

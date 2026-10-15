@@ -27,8 +27,14 @@ retriever that found it.
 (similarity of embedding vectors). **Hybrid** search fuses both. In the API, the keyword
 retriever is named `bm25`, both as a `mode` and in each hit's `ranks`.
 
-**Models**: the optional AI behind the index: an **embedder** (text to vectors) and a
-**reranker** (rescores hits against the query). Without models, the index is keyword-only.
+**Context**: one or two sentences an LLM writes for a chunk at build time, saying which document
+it belongs to and what it covers. Ariadne indexes and embeds it with the chunk, so a section that
+never names its subject can still be found by it. Ariadne caches each context by the exact chunk
+text, so it is written once.
+
+**Models**: the optional AI behind the index: an **embedder** (text to vectors), a **reranker**
+(rescores hits against the query), and a **contextualizer** (writes contexts). Without models,
+the index is keyword-only.
 
 **Eval set**: questions with the documents that answer them, used to measure retrieval as
 Recall@k and MRR.
