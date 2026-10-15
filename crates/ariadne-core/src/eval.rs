@@ -1,6 +1,6 @@
 //! Retrieval evaluation: Recall@k and MRR over a question set with known answer files.
 
-use crate::index::{Index, Mode, SearchOptions};
+use crate::{Index, Mode, SearchOptions};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -35,14 +35,13 @@ fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
 
-pub fn evaluate(
-    index: &mut Index,
-    set: &EvalSet,
-    k: usize,
-    rerank: bool,
-    has_embedder: bool,
-) -> Result<EvalReport> {
-    let has_reranker = index.stats()?.reranker.is_some();
+/// Score `index` against `set`: for each mode, the share of questions whose top `k` contains
+/// an expected file (Recall@k) and the mean reciprocal rank of the first one (MRR). Dense mode
+/// is skipped for a keyword-only index.
+pub fn evaluate(index: &mut Index, set: &EvalSet, k: usize, rerank: bool) -> Result<EvalReport> {
+    let stats = index.stats()?;
+    let has_embedder = stats.embedder.as_deref().is_some_and(|e| e != "none");
+    let has_reranker = stats.reranker.is_some();
     let mut report = EvalReport {
         k,
         questions: set.questions.len(),
@@ -91,20 +90,18 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::tests::{excludes, repo, HashEmbedder};
+    use crate::index::tests::Fixture;
 
     #[test]
     fn scores_hits_and_misses() {
-        let src = repo();
-        let db = tempfile::tempdir().unwrap();
-        let mut idx =
-            Index::open(&db.path().join("i.db"), Some(Box::new(HashEmbedder)), None).unwrap();
-        idx.build(src.path(), &excludes(), 1200).unwrap();
+        let f = Fixture::new();
+        let mut idx = f.open(true);
+        idx.build().unwrap();
         let set: EvalSet = serde_json::from_str(
             r#"{"questions":[{"q":"moonraker 7125","expect":["systems/fabrication/qidi.md"]},{"q":"zzz","expect":["nope.md"]}]}"#,
         )
         .unwrap();
-        let report = evaluate(&mut idx, &set, 1, false, true).unwrap();
+        let report = evaluate(&mut idx, &set, 1, false).unwrap();
         assert_eq!(
             report.modes["hybrid"],
             ModeScore {

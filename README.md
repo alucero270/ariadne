@@ -16,10 +16,12 @@
 > ./target/release/ariadne --embed-url http://127.0.0.1:8085 --embed-model bge-m3-embed ...
 > ```
 >
-> Endpoints: `GET /health`, `GET /search?q=&k=&mode=hybrid|bm25|dense`, `GET /documents?path=`,
-> `POST /reindex`, and `POST /mcp` (JSON-RPC: tools `search` and `read_document`). Measure
-> retrieval with `ariadne eval eval/pantheon-evalset.json --root <pantheon checkout>`. Docker:
-> `ops/ariadne/`.
+> Endpoints: `GET /health`, `GET /search?q=&k=&mode=hybrid|bm25|dense` (`k` from 1 to 20),
+> `GET /documents?path=` (404 for anything not indexed), `POST /reindex` (searches keep working
+> while it runs), and `POST /mcp` (JSON-RPC: tools `search` and `read_document`). Every endpoint
+> but `/health` needs the bearer token when one is set. Measure retrieval with
+> `ariadne eval eval/pantheon-evalset.json --root <pantheon checkout>`. Docker: `ops/ariadne/`.
+> Terms are defined in [GLOSSARY.md](GLOSSARY.md).
 
 Strata is a self-hosted knowledge ingestion and retrieval system for internal
 content with explicit source boundaries and no required AI layer.
