@@ -1,26 +1,11 @@
-//! Clients for OpenAI-compatible embedding and llama.cpp-style rerank endpoints.
+//! HTTP adapters for the model ports: OpenAI-compatible `/v1/embeddings` and llama.cpp-style
+//! `/v1/rerank`, such as llama-swap serves.
 
 use anyhow::{anyhow, Context, Result};
+use ariadne_core::ports::normalize;
+use ariadne_core::{Embedder, Reranker};
 use serde_json::{json, Value};
 use std::time::Duration;
-
-pub trait Embedder: Send {
-    fn name(&self) -> String;
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
-}
-
-pub trait Reranker: Send {
-    fn name(&self) -> String;
-    fn rerank(&self, query: &str, documents: &[String]) -> Result<Vec<f32>>;
-}
-
-pub fn normalize(mut v: Vec<f32>) -> Vec<f32> {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        v.iter_mut().for_each(|x| *x /= norm);
-    }
-    v
-}
 
 fn agent(timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(timeout).build()

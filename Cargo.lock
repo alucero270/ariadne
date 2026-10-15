@@ -90,6 +90,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "ureq",
 ]
 
 [[package]]
@@ -102,7 +103,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "ureq",
 ]
 
 [[package]]

@@ -1,14 +1,15 @@
-mod server;
+mod app;
+mod http;
+mod mcp;
+mod upstream;
 
 use anyhow::{bail, Context, Result};
 use ariadne_core::eval::{evaluate, EvalSet};
-use ariadne_core::models::{Embedder, HttpEmbedder, HttpReranker, Reranker};
-use ariadne_core::source::DEFAULT_EXCLUDES;
-use ariadne_core::{Index, Mode, SearchOptions};
+use ariadne_core::{Index, Mode, Models, SearchOptions, Source};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use upstream::{HttpEmbedder, HttpReranker};
 
 const MIN_TOKEN_CHARS: usize = 16;
 
@@ -63,7 +64,8 @@ enum Command {
         #[arg(long, default_value = "hybrid")]
         mode: Mode,
     },
-    /// Measure Recall@k and MRR against an eval set ({"questions":[{"q","expect":[paths]}]}).
+    /// Update the index, then measure Recall@k and MRR against an eval set
+    /// ({"questions":[{"q","expect":[paths]}]}).
     Eval {
         file: PathBuf,
         #[arg(short, default_value_t = 5)]
@@ -72,7 +74,7 @@ enum Command {
         #[arg(long)]
         rerank: bool,
     },
-    /// Serve the HTTP API and MCP endpoint. Indexes --root at startup.
+    /// Update the index, then serve the HTTP API and MCP endpoint.
     Serve {
         #[arg(long, env = "ARIADNE_BIND", default_value = "127.0.0.1:8090")]
         bind: SocketAddr,
@@ -82,33 +84,40 @@ enum Command {
     },
 }
 
-fn excludes() -> Vec<String> {
-    DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect()
-}
+impl Cli {
+    fn source(&self) -> Result<Source> {
+        let root = self
+            .root
+            .clone()
+            .context("--root (or ARIADNE_ROOT) is required")?;
+        Ok(Source {
+            max_chars: self.max_chars,
+            ..Source::new(root)
+        })
+    }
 
-fn open_index(cli: &Cli) -> Result<Index> {
-    let embedder: Option<Box<dyn Embedder>> = match (&cli.embed_url, &cli.embed_model) {
-        (Some(url), Some(model)) => {
-            Some(Box::new(HttpEmbedder::new(url, model, &cli.upstream_key)))
-        }
-        (None, None) => None,
-        _ => bail!("set both ARIADNE_EMBED_URL and ARIADNE_EMBED_MODEL, or neither"),
-    };
-    let reranker: Option<Box<dyn Reranker>> = match (&cli.rerank_url, &cli.rerank_model) {
-        (Some(url), Some(model)) => {
-            Some(Box::new(HttpReranker::new(url, model, &cli.upstream_key)))
-        }
-        (None, None) => None,
-        _ => bail!("set both ARIADNE_RERANK_URL and ARIADNE_RERANK_MODEL, or neither"),
-    };
-    Index::open(&cli.db, embedder, reranker)
-        .with_context(|| format!("opening index {}", cli.db.display()))
-}
+    fn models(&self) -> Result<Models> {
+        let embedder = match (&self.embed_url, &self.embed_model) {
+            (Some(url), Some(model)) => {
+                Some(Box::new(HttpEmbedder::new(url, model, &self.upstream_key)) as _)
+            }
+            (None, None) => None,
+            _ => bail!("set both ARIADNE_EMBED_URL and ARIADNE_EMBED_MODEL, or neither"),
+        };
+        let reranker = match (&self.rerank_url, &self.rerank_model) {
+            (Some(url), Some(model)) => {
+                Some(Box::new(HttpReranker::new(url, model, &self.upstream_key)) as _)
+            }
+            (None, None) => None,
+            _ => bail!("set both ARIADNE_RERANK_URL and ARIADNE_RERANK_MODEL, or neither"),
+        };
+        Ok(Models { embedder, reranker })
+    }
 
-fn require_root(cli: &Cli) -> Result<&Path> {
-    cli.root
-        .as_deref()
-        .context("--root (or ARIADNE_ROOT) is required for this command")
+    fn open_index(&self) -> Result<Index> {
+        Index::open(&self.db, self.source()?, self.models()?)
+            .with_context(|| format!("opening index {}", self.db.display()))
+    }
 }
 
 fn check_serve_auth(bind: &SocketAddr, token: Option<&str>) -> Result<()> {
@@ -126,10 +135,9 @@ fn check_serve_auth(bind: &SocketAddr, token: Option<&str>) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut index = open_index(&cli)?;
     match &cli.command {
         Command::Index => {
-            let stats = index.build(require_root(&cli)?, &excludes(), cli.max_chars)?;
+            let stats = cli.open_index()?.build()?;
             println!("{}", serde_json::to_string(&stats)?);
         }
         Command::Search { query, k, mode } => {
@@ -138,35 +146,26 @@ async fn main() -> Result<()> {
                 mode: *mode,
                 ..Default::default()
             };
-            for h in index.search(query, &opts)? {
+            for h in cli.open_index()?.search(query, &opts)? {
                 println!("{:.4}  [[{}]]  {:?}", h.score, h.reference, h.ranks);
             }
         }
         Command::Eval { file, k, rerank } => {
-            if let Some(root) = &cli.root {
-                index.build(root, &excludes(), cli.max_chars)?;
-            }
             let set: EvalSet = serde_json::from_str(&std::fs::read_to_string(file)?)
                 .with_context(|| format!("reading eval set {}", file.display()))?;
-            let report = evaluate(&mut index, &set, *k, *rerank, cli.embed_url.is_some())?;
+            let mut index = cli.open_index()?;
+            index.build()?;
+            let report = evaluate(&mut index, &set, *k, *rerank)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Serve { bind, token } => {
             check_serve_auth(bind, token.as_deref())?;
-            if let Some(root) = &cli.root {
-                let stats = index.build(root, &excludes(), cli.max_chars)?;
-                eprintln!("indexed: {}", serde_json::to_string(&stats)?);
-            }
-            let state = server::AppState {
-                index: Arc::new(Mutex::new(index)),
-                root: cli.root.clone(),
-                excludes: excludes(),
-                max_chars: cli.max_chars,
-                token: token.clone(),
-            };
+            let mut writer = cli.open_index()?;
+            eprintln!("indexed: {}", serde_json::to_string(&writer.build()?)?);
+            let app = app::App::new(cli.open_index()?, writer);
             let listener = tokio::net::TcpListener::bind(bind).await?;
             eprintln!("ariadne listening on http://{bind}");
-            axum::serve(listener, server::router(state))
+            axum::serve(listener, http::router(app, token.clone()))
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
                 })
