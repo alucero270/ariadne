@@ -68,20 +68,25 @@ async fn require_token(
     req: Request,
     next: Next,
 ) -> Response {
-    if let Some(expected) = &state.expected_auth {
-        let supplied = headers
-            .get("authorization")
-            .map(|v| v.as_bytes())
-            .unwrap_or_default();
-        if !constant_time_eq(supplied, expected.as_bytes()) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "invalid or missing bearer token" })),
-            )
-                .into_response();
-        }
+    if !authorized(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid or missing bearer token" })),
+        )
+            .into_response();
     }
     next.run(req).await
+}
+
+fn authorized(state: &HttpState, headers: &HeaderMap) -> bool {
+    let Some(expected) = &state.expected_auth else {
+        return true;
+    };
+    let supplied = headers
+        .get("authorization")
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
+    constant_time_eq(supplied, expected.as_bytes())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -95,11 +100,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-async fn health(State(s): State<HttpState>) -> Result<Json<Value>, AppError> {
-    let stats = s.app.stats().await?;
-    Ok(Json(
-        json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION"), "index": stats }),
-    ))
+/// Open to everyone so load balancers can probe it. Index details only for authorized callers.
+async fn health(State(s): State<HttpState>, headers: HeaderMap) -> Result<Json<Value>, AppError> {
+    let mut body = json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") });
+    if authorized(&s, &headers) {
+        body["index"] = json!(s.app.stats().await?);
+    }
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]
@@ -114,7 +121,6 @@ async fn search(
     State(s): State<HttpState>,
     Query(p): Query<SearchParams>,
 ) -> Result<Json<Value>, AppError> {
-    let query = p.q.trim().to_string();
     let hits = s
         .app
         .search(SearchRequest {
@@ -124,7 +130,7 @@ async fn search(
             rerank: p.rerank,
         })
         .await?;
-    Ok(Json(json!({ "query": query, "results": hits })))
+    Ok(Json(json!({ "results": hits })))
 }
 
 #[derive(Deserialize)]
@@ -188,10 +194,11 @@ mod tests {
         let f = fixture();
         let router = router(f.app.clone(), Some(TOKEN.into()));
         let (status, body) = send(&router, "GET", "/health", None).await;
-        assert_eq!(
-            (status, body["index"]["files"].clone()),
-            (StatusCode::OK, json!(1))
-        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert!(body.get("index").is_none(), "index details leaked: {body}");
+        let (_, body) = send(&router, "GET", "/health", Some(TOKEN)).await;
+        assert_eq!(body["index"]["files"], 1);
         for (method, uri) in [
             ("GET", "/search?q=moonraker"),
             ("GET", "/documents?path=x"),

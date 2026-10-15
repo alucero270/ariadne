@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use upstream::{HttpEmbedder, HttpReranker};
 
 const MIN_TOKEN_CHARS: usize = 16;
+/// Well under the HTTP layer's 4 KiB cap on the Authorization header, so a valid token can
+/// always be sent.
+const MAX_TOKEN_CHARS: usize = 1024;
 
 #[derive(Parser)]
 #[command(
@@ -122,8 +125,8 @@ impl Cli {
 
 fn check_serve_auth(bind: &SocketAddr, token: Option<&str>) -> Result<()> {
     match token {
-        Some(t) if t.chars().count() < MIN_TOKEN_CHARS => {
-            bail!("ARIADNE_TOKEN must be at least {MIN_TOKEN_CHARS} characters")
+        Some(t) if !(MIN_TOKEN_CHARS..=MAX_TOKEN_CHARS).contains(&t.chars().count()) => {
+            bail!("ARIADNE_TOKEN must be {MIN_TOKEN_CHARS} to {MAX_TOKEN_CHARS} characters")
         }
         None if !bind.ip().is_loopback() => {
             bail!("refusing to listen on {bind} without ARIADNE_TOKEN; set a token or bind to 127.0.0.1")
@@ -187,5 +190,6 @@ mod tests {
         assert!(check_serve_auth(&open, None).is_err());
         assert!(check_serve_auth(&open, Some("short")).is_err());
         assert!(check_serve_auth(&open, Some("0123456789abcdef")).is_ok());
+        assert!(check_serve_auth(&open, Some(&"x".repeat(MAX_TOKEN_CHARS + 1))).is_err());
     }
 }

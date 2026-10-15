@@ -43,6 +43,37 @@ pub enum Mode {
     Dense,
 }
 
+impl Mode {
+    fn retrievers(self) -> &'static [Retriever] {
+        match self {
+            Mode::Hybrid => &[Retriever::Keyword, Retriever::Dense],
+            Mode::Bm25 => &[Retriever::Keyword],
+            Mode::Dense => &[Retriever::Dense],
+        }
+    }
+}
+
+/// One way of finding chunks. See GLOSSARY.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retriever {
+    Keyword,
+    Dense,
+}
+
+impl Retriever {
+    /// The name callers see in `Hit::ranks`, matching the `mode` names.
+    fn label(self) -> &'static str {
+        match self {
+            Retriever::Keyword => "bm25",
+            Retriever::Dense => "dense",
+        }
+    }
+}
+
+/// Hits kept from fusion before reranking and the per-document cap, so both have enough
+/// candidates to choose from even when `k` is small.
+const MIN_FUSION_POOL: usize = 20;
+
 impl std::str::FromStr for Mode {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -164,6 +195,10 @@ impl Index {
             store::clear(&tx)?;
         }
         let known = store::file_hashes(&tx)?;
+        let mut dimensions: Option<usize> = match full {
+            true => None,
+            false => store::meta(&tx, "dimensions")?.and_then(|d| d.parse().ok()),
+        };
         let mut stats = BuildStats {
             files_seen: files.len(),
             ..Default::default()
@@ -188,6 +223,17 @@ impl Index {
                 }
                 _ => None,
             };
+            for v in vectors.iter().flatten() {
+                match dimensions {
+                    None => dimensions = Some(v.len()),
+                    Some(d) if d != v.len() => bail!(
+                        "embedding size changed from {d} to {} under the same embedder name; \
+                         delete the index file to rebuild",
+                        v.len()
+                    ),
+                    Some(_) => {}
+                }
+            }
             store::write_file(&tx, &file.rel, &sha, &chunks, vectors.as_deref())?;
             stats.files_changed += 1;
             stats.chunks_written += chunks.len();
@@ -198,6 +244,9 @@ impl Index {
         }
         for (key, value) in &settings {
             store::set_meta(&tx, key, value)?;
+        }
+        if let Some(d) = dimensions {
+            store::set_meta(&tx, "dimensions", &d.to_string())?;
         }
         store::set_meta(&tx, "indexed_at", &now_utc())?;
         tx.commit()?;
@@ -229,8 +278,8 @@ impl Index {
         );
         let mut hits = fused
             .into_iter()
-            .take(opts.k.max(20))
-            .map(|(id, score)| self.hit(id, score, &rankings))
+            .take(opts.k.max(MIN_FUSION_POOL))
+            .map(|(id, score)| self.to_hit(id, score, &rankings))
             .collect::<Result<Vec<_>>>()?;
         if opts.rerank {
             self.rerank(query, &mut hits)?;
@@ -265,18 +314,19 @@ impl Index {
         &mut self,
         query: &str,
         opts: &SearchOptions,
-    ) -> Result<Vec<(&'static str, Vec<i64>)>> {
+    ) -> Result<Vec<(Retriever, Vec<i64>)>> {
         let mut rankings = Vec::new();
-        if matches!(opts.mode, Mode::Hybrid | Mode::Bm25) {
-            rankings.push((
-                "bm25",
-                store::keyword_ids(&self.conn, &fts_query(query), opts.candidates)?,
-            ));
+        for &retriever in opts.mode.retrievers() {
+            let ids = match retriever {
+                Retriever::Keyword => {
+                    store::keyword_ids(&self.conn, &fts_query(query), opts.candidates)?
+                }
+                Retriever::Dense => self.dense_ids(query, opts.candidates)?,
+            };
+            if !ids.is_empty() {
+                rankings.push((retriever, ids));
+            }
         }
-        if matches!(opts.mode, Mode::Hybrid | Mode::Dense) {
-            rankings.push(("dense", self.dense_ids(query, opts.candidates)?));
-        }
-        rankings.retain(|(_, r)| !r.is_empty());
         Ok(rankings)
     }
 
@@ -304,6 +354,14 @@ impl Index {
             .embed(&[query.to_string()])?
             .pop()
             .ok_or_else(|| anyhow!("embedder returned no vector for the query"))?;
+        let stored = cache.vectors[0].len();
+        if query_vector.len() != stored {
+            bail!(
+                "query embedding has {} dimensions but the index has {stored}; \
+                 delete the index file to rebuild",
+                query_vector.len()
+            );
+        }
         let mut scored: Vec<(f32, i64)> = cache
             .vectors
             .iter()
@@ -314,14 +372,14 @@ impl Index {
         Ok(scored.into_iter().take(limit).map(|(_, id)| id).collect())
     }
 
-    fn hit(&self, id: i64, score: f64, rankings: &[(&str, Vec<i64>)]) -> Result<Hit> {
+    fn to_hit(&self, id: i64, score: f64, rankings: &[(Retriever, Vec<i64>)]) -> Result<Hit> {
         let c = store::chunk(&self.conn, id)?;
         let ranks = rankings
             .iter()
-            .filter_map(|(name, r)| {
+            .filter_map(|(retriever, r)| {
                 r.iter()
                     .position(|x| *x == id)
-                    .map(|p| (name.to_string(), p + 1))
+                    .map(|p| (retriever.label().to_string(), p + 1))
             })
             .collect();
         Ok(Hit {
@@ -621,6 +679,35 @@ pub(crate) mod tests {
                 "{bad} should not be readable"
             );
         }
+    }
+
+    /// Same name as `HashEmbedder`, different size: a model swapped behind an unchanged name.
+    struct ResizedEmbedder;
+
+    impl Embedder for ResizedEmbedder {
+        fn name(&self) -> String {
+            "hash:64".into()
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| normalize(vec![1.0; 32])).collect())
+        }
+    }
+
+    #[test]
+    fn a_resized_embedder_is_an_error_not_garbage() {
+        let f = Fixture::new();
+        f.open(true).build().unwrap();
+        let mut resized = f.open_with(Models {
+            embedder: Some(Box::new(ResizedEmbedder)),
+            reranker: None,
+        });
+        let err = resized
+            .search("whisper", &opts(Mode::Dense, 1))
+            .unwrap_err();
+        assert!(err.to_string().contains("dimensions"), "{err}");
+        f.write("new.md", "# New\n\nfresh text\n");
+        let err = resized.build().unwrap_err();
+        assert!(err.to_string().contains("embedding size changed"), "{err}");
     }
 
     #[test]
