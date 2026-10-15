@@ -68,11 +68,12 @@ pub fn walk_markdown(root: &Path, excludes: &[String]) -> Result<Vec<SourceFile>
         for entry in entries {
             let name = entry.file_name().to_string_lossy().into_owned();
             let rel = format!("{prefix}{name}");
-            let meta = entry.metadata()?;
+            // Check the type before reading metadata, so a link is skipped without following it.
             let kind = entry.file_type()?;
             if kind.is_symlink() {
                 continue;
             }
+            let meta = entry.metadata()?;
             if kind.is_dir() {
                 if !excluded(&format!("{rel}/"), excludes) {
                     stack.push((entry.path(), format!("{rel}/")));
@@ -151,6 +152,8 @@ mod tests {
         fs::write(dir.path().join("outside.md"), "# secret").unwrap();
         std::os::unix::fs::symlink(dir.path().join("outside.md"), root.join("link.md")).unwrap();
         std::os::unix::fs::symlink(dir.path(), root.join("linkdir")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing.md"), root.join("dangling.md"))
+            .unwrap();
 
         let rels: Vec<_> = walk_markdown(&root, &defaults())
             .unwrap()

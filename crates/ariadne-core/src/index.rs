@@ -39,8 +39,12 @@ impl Source {
         }
     }
 
+    /// Chunk size in characters. Values below 1 are treated as 1.
     pub fn with_max_chars(self, max_chars: usize) -> Self {
-        Self { max_chars, ..self }
+        Self {
+            max_chars: max_chars.max(1),
+            ..self
+        }
     }
 }
 
@@ -645,6 +649,11 @@ fn now_utc() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn zero_max_chars_is_clamped_so_chunking_ends() {
+        assert_eq!(Source::new("/x").with_max_chars(0).max_chars, 1);
+    }
     use crate::ports::Reranker;
     use std::fs;
 

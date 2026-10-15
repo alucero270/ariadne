@@ -1,0 +1,7 @@
+# Opt-in host port for standalone use:
+#   docker compose -f compose.yml -f compose.local.yml up -d
+# Loopback only. Deployments that reach Ariadne over a shared Docker network skip this file.
+services:
+  ariadne:
+    ports:
+      - "127.0.0.1:${ARIADNE_HOST_PORT:-8090}:8090"
