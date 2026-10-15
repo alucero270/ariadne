@@ -23,7 +23,8 @@
 > `GET /documents?path=` (404 for anything not indexed), `POST /reindex` (searches keep working
 > while it runs), and `POST /mcp` (JSON-RPC: tools `search` and `read_document`). Every endpoint
 > but `/health` needs the bearer token when one is set. Measure retrieval with
-> `ariadne eval eval/pantheon-evalset.json --root <pantheon checkout>`. Docker: `ops/ariadne/`.
+> `ariadne eval eval/pantheon-evalset.json --root <pantheon checkout>`. Docker: `ops/ariadne/` (the base file publishes no port; add
+> `-f compose.local.yml` to reach it on `127.0.0.1:8090`).
 > Terms are defined in [GLOSSARY.md](GLOSSARY.md).
 
 Strata is a self-hosted knowledge ingestion and retrieval system for internal
