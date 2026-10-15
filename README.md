@@ -1,5 +1,26 @@
 # Strata
 
+> **Becoming Ariadne.** Strata is being renamed **Ariadne** and rebuilt in Rust, with hybrid
+> search (keyword plus embeddings) and an MCP server for agents. See
+> [ADR-003](docs/adr/ADR-003-ariadne-rust-rebuild.md). The Rust workspace lives in `crates/`;
+> the .NET code under `src/` is unchanged until Ariadne reaches parity. Quick start below.
+>
+> ```bash
+> cargo build --release -p ariadne
+> # keyword-only search over a folder of Markdown
+> ./target/release/ariadne --root ~/notes --db ariadne.db index
+> ./target/release/ariadne --root ~/notes --db ariadne.db search "which ports does the printer expose"
+> # HTTP API and MCP on 127.0.0.1:8090 (a token is required on any other address)
+> ./target/release/ariadne --root ~/notes --db ariadne.db serve
+> # add embeddings from any OpenAI-compatible endpoint, e.g. llama-swap
+> ./target/release/ariadne --embed-url http://127.0.0.1:8085 --embed-model bge-m3-embed ...
+> ```
+>
+> Endpoints: `GET /health`, `GET /search?q=&k=&mode=hybrid|bm25|dense`, `GET /documents?path=`,
+> `POST /reindex`, and `POST /mcp` (JSON-RPC: tools `search` and `read_document`). Measure
+> retrieval with `ariadne eval eval/pantheon-evalset.json --root <pantheon checkout>`. Docker:
+> `ops/ariadne/`.
+
 Strata is a self-hosted knowledge ingestion and retrieval system for internal
 content with explicit source boundaries and no required AI layer.
 
