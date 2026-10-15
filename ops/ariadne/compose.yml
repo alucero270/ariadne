@@ -1,0 +1,19 @@
+name: ariadne
+
+services:
+  ariadne:
+    build:
+      context: ../..
+      dockerfile: ops/ariadne/Dockerfile
+    image: ariadne:0.1.0
+    container_name: ariadne
+    env_file: .env
+    volumes:
+      - ${ARIADNE_SOURCE_HOST_PATH:?set ARIADNE_SOURCE_HOST_PATH in .env}:/source:ro
+      - ariadne-index:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  ariadne-index:
