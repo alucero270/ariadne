@@ -5,11 +5,11 @@
 //! answering while a writer rebuilds, and pick up the new data once the rebuild commits.
 
 use crate::chunk::{chunk_markdown, reference};
-use crate::ports::Models;
+use crate::ports::{normalize, Embedder, Models};
 use crate::rank::{cap_per_key, fts_query, fuse};
 use crate::source::{resolve_inside, walk_markdown, DEFAULT_EXCLUDES};
 use crate::store;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use rusqlite::Connection;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -17,21 +17,28 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// What to index: a root folder, paths under it to skip, and the largest chunk in characters.
+/// What to index: a root folder (read-only), the paths under it to skip, and the largest chunk
+/// in characters. See GLOSSARY.md.
 #[derive(Debug, Clone)]
 pub struct Source {
-    pub root: PathBuf,
-    pub excludes: Vec<String>,
-    pub max_chars: usize,
+    root: PathBuf,
+    excludes: Vec<String>,
+    max_chars: usize,
 }
 
 impl Source {
+    /// A source with the default excludes (VCS and editor folders, `node_modules`, scratch
+    /// artifacts) and chunks of at most 1200 characters.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
             max_chars: 1200,
         }
+    }
+
+    pub fn with_max_chars(self, max_chars: usize) -> Self {
+        Self { max_chars, ..self }
     }
 }
 
@@ -44,6 +51,16 @@ pub enum Mode {
 }
 
 impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::Bm25, Mode::Dense, Mode::Hybrid];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Hybrid => "hybrid",
+            Mode::Bm25 => "bm25",
+            Mode::Dense => "dense",
+        }
+    }
+
     fn retrievers(self) -> &'static [Retriever] {
         match self {
             Mode::Hybrid => &[Retriever::Keyword, Retriever::Dense],
@@ -88,22 +105,24 @@ impl std::str::FromStr for Mode {
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
-    pub k: usize,
-    pub mode: Mode,
+    k: usize,
+    mode: Mode,
+    rerank: bool,
     /// Candidates taken from each retriever before fusion.
-    pub candidates: usize,
-    pub rerank: bool,
+    candidates: usize,
     /// At most this many hits per document; `None` for no cap.
-    pub max_per_document: Option<usize>,
+    max_per_document: Option<usize>,
 }
 
-impl Default for SearchOptions {
-    fn default() -> Self {
+impl SearchOptions {
+    /// `k` hits in `mode`; `rerank` applies the reranker when one is configured. Each document
+    /// contributes at most two hits.
+    pub fn new(k: usize, mode: Mode, rerank: bool) -> Self {
         Self {
-            k: 8,
-            mode: Mode::Hybrid,
+            k,
+            mode,
+            rerank,
             candidates: 40,
-            rerank: true,
             max_per_document: Some(2),
         }
     }
@@ -219,7 +238,7 @@ impl Index {
             let vectors = match &self.models.embedder {
                 Some(e) if !chunks.is_empty() => {
                     let texts: Vec<String> = chunks.iter().map(|c| c.embed_text()).collect();
-                    Some(e.embed(&texts)?)
+                    Some(embed_checked(e.as_ref(), &texts)?)
                 }
                 _ => None,
             };
@@ -253,6 +272,14 @@ impl Index {
         self.cache = None;
         stats.seconds = (start.elapsed().as_secs_f64() * 100.0).round() / 100.0;
         Ok(stats)
+    }
+
+    pub(crate) fn has_embedder(&self) -> bool {
+        self.models.embedder.is_some()
+    }
+
+    pub(crate) fn has_reranker(&self) -> bool {
+        self.models.reranker.is_some()
     }
 
     pub fn stats(&self) -> Result<IndexStats> {
@@ -350,10 +377,9 @@ impl Index {
         if cache.ids.is_empty() {
             return Ok(Vec::new());
         }
-        let query_vector = embedder
-            .embed(&[query.to_string()])?
+        let query_vector = embed_checked(embedder.as_ref(), &[query.to_string()])?
             .pop()
-            .ok_or_else(|| anyhow!("embedder returned no vector for the query"))?;
+            .expect("embed_checked returns one vector per input");
         let stored = cache.vectors[0].len();
         if query_vector.len() != stored {
             bail!(
@@ -414,6 +440,21 @@ impl Index {
     }
 }
 
+/// Hold the `Embedder` contract here rather than trusting each adapter: one vector per input,
+/// and unit length so a dot product is cosine similarity.
+fn embed_checked(embedder: &dyn Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    let vectors = embedder.embed(texts)?;
+    if vectors.len() != texts.len() {
+        bail!(
+            "embedder {} returned {} vectors for {} texts",
+            embedder.name(),
+            vectors.len(),
+            texts.len()
+        );
+    }
+    Ok(vectors.into_iter().map(normalize).collect())
+}
+
 fn now_utc() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -437,7 +478,7 @@ fn now_utc() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::ports::{normalize, Embedder, Reranker};
+    use crate::ports::Reranker;
     use std::fs;
 
     /// Deterministic bag-of-words embedder so dense search is testable without a model.
@@ -515,11 +556,7 @@ pub(crate) mod tests {
     }
 
     fn opts(mode: Mode, k: usize) -> SearchOptions {
-        SearchOptions {
-            k,
-            mode,
-            ..Default::default()
-        }
+        SearchOptions::new(k, mode, true)
     }
 
     #[test]
@@ -628,7 +665,7 @@ pub(crate) mod tests {
         let base = SearchOptions {
             k: 20,
             max_per_document: None,
-            ..Default::default()
+            ..SearchOptions::new(8, Mode::Hybrid, true)
         };
         let plain = idx
             .search(
@@ -649,7 +686,7 @@ pub(crate) mod tests {
                 &SearchOptions {
                     k: 10,
                     max_per_document: Some(1),
-                    ..Default::default()
+                    ..SearchOptions::new(8, Mode::Hybrid, true)
                 },
             )
             .unwrap();
@@ -708,6 +745,54 @@ pub(crate) mod tests {
         f.write("new.md", "# New\n\nfresh text\n");
         let err = resized.build().unwrap_err();
         assert!(err.to_string().contains("embedding size changed"), "{err}");
+    }
+
+    /// Breaks the port contract both ways: unnormalized vectors, and one vector too few.
+    struct SloppyEmbedder {
+        short: bool,
+    }
+
+    impl Embedder for SloppyEmbedder {
+        fn name(&self) -> String {
+            "sloppy".into()
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let n = if self.short {
+                texts.len() - 1
+            } else {
+                texts.len()
+            };
+            let hashed = HashEmbedder.embed(&texts[..n])?;
+            Ok(hashed
+                .into_iter()
+                .map(|v| v.iter().map(|x| x * 7.0).collect())
+                .collect())
+        }
+    }
+
+    #[test]
+    fn the_index_holds_the_embedder_contract() {
+        let f = Fixture::new();
+        let mut unnormalized = f.open_with(Models {
+            embedder: Some(Box::new(SloppyEmbedder { short: false })),
+            reranker: None,
+        });
+        unnormalized.build().unwrap();
+        let hits = unnormalized
+            .search("moonraker port 7125", &opts(Mode::Dense, 1))
+            .unwrap();
+        assert_eq!(
+            hits[0].reference,
+            "systems/fabrication/qidi#Network Placement"
+        );
+
+        let g = Fixture::new();
+        let mut short = g.open_with(Models {
+            embedder: Some(Box::new(SloppyEmbedder { short: true })),
+            reranker: None,
+        });
+        let err = short.build().unwrap_err();
+        assert!(err.to_string().contains("returned"), "{err}");
     }
 
     #[test]

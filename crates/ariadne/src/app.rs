@@ -1,12 +1,17 @@
-//! The application module: everything a front end (HTTP, MCP) can ask of Ariadne, validated
-//! once, with errors typed by who is at fault.
+//! The application module: everything a front end (CLI, HTTP, MCP) can ask of Ariadne. It owns
+//! the defaults and limits, validates once, and types errors by who is at fault. Front ends
+//! only choose how to present results.
 
-use ariadne_core::{BuildStats, Hit, Index, IndexStats, Mode, SearchOptions};
+use ariadne_core::{BuildStats, EvalReport, EvalSet, Hit, Index, IndexStats, Mode, SearchOptions};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+pub const DEFAULT_K: u64 = 5;
 pub const MAX_K: u64 = 20;
 pub const MAX_QUERY_CHARS: usize = 500;
+pub const MAX_PATH_CHARS: usize = 400;
+/// Served searches rerank by default; evaluation measures the same behaviour.
+const DEFAULT_RERANK: bool = true;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -17,6 +22,8 @@ pub enum AppError {
     /// Ariadne or one of its models failed. Log it; don't show the details to callers.
     Internal(anyhow::Error),
 }
+
+impl std::error::Error for AppError {}
 
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -44,24 +51,24 @@ impl SearchRequest {
                 "query must be 1 to {MAX_QUERY_CHARS} characters"
             )));
         }
-        let k = self.k.unwrap_or(SearchOptions::default().k as u64);
-        if !(1..=MAX_K).contains(&k) {
-            return Err(AppError::BadRequest(format!("k must be from 1 to {MAX_K}")));
-        }
+        let k = validate_k(self.k)?;
         let mode = match self.mode.as_deref() {
             None => Mode::Hybrid,
             Some(m) => m
                 .parse::<Mode>()
                 .map_err(|e| AppError::BadRequest(e.to_string()))?,
         };
-        let opts = SearchOptions {
-            k: k as usize,
-            mode,
-            rerank: self.rerank.unwrap_or(true),
-            ..Default::default()
-        };
+        let opts = SearchOptions::new(k, mode, self.rerank.unwrap_or(DEFAULT_RERANK));
         Ok((query, opts))
     }
+}
+
+fn validate_k(k: Option<u64>) -> Result<usize, AppError> {
+    let k = k.unwrap_or(DEFAULT_K);
+    if !(1..=MAX_K).contains(&k) {
+        return Err(AppError::BadRequest(format!("k must be from 1 to {MAX_K}")));
+    }
+    Ok(k as usize)
 }
 
 /// Two handles on one index: reads go to `reader`, rebuilds to `writer`, so a rebuild never
@@ -91,10 +98,29 @@ impl App {
     }
 
     pub async fn read_document(self: &Arc<Self>, path: String) -> Result<String, AppError> {
+        if path.is_empty() || path.chars().count() > MAX_PATH_CHARS {
+            return Err(AppError::BadRequest(format!(
+                "path must be 1 to {MAX_PATH_CHARS} characters"
+            )));
+        }
         self.with_reader(move |idx| {
             idx.read_document(&path)
                 .map_err(AppError::Internal)?
                 .ok_or_else(|| AppError::NotFound(format!("no indexed document at {path}")))
+        })
+        .await
+    }
+
+    /// Measure retrieval with the same defaults searches are served with.
+    pub async fn evaluate(
+        self: &Arc<Self>,
+        set: EvalSet,
+        k: Option<u64>,
+    ) -> Result<EvalReport, AppError> {
+        let k = validate_k(k)?;
+        self.with_reader(move |idx| {
+            idx.evaluate(&set, k, DEFAULT_RERANK)
+                .map_err(AppError::Internal)
         })
         .await
     }
@@ -208,6 +234,32 @@ pub(crate) mod tests {
             hits[0].reference,
             "systems/fabrication/qidi#Network Placement"
         );
+    }
+
+    #[tokio::test]
+    async fn evaluate_measures_with_the_served_defaults() {
+        let f = fixture();
+        let set: EvalSet = serde_json::from_str(
+            r#"{"questions":[{"q":"moonraker","expect":["systems/fabrication/qidi.md"]}]}"#,
+        )
+        .unwrap();
+        let report = f.app.evaluate(set, None).await.unwrap();
+        assert_eq!(report.k, DEFAULT_K as usize);
+        assert!(
+            !report.modes.contains_key("dense"),
+            "no embedder configured"
+        );
+        assert_eq!(report.modes["hybrid"].recall_at_k, 1.0);
+    }
+
+    #[tokio::test]
+    async fn overlong_paths_are_bad_requests() {
+        let f = fixture();
+        let long = "a/".repeat(MAX_PATH_CHARS);
+        assert!(matches!(
+            f.app.read_document(long).await,
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[tokio::test]
