@@ -19,3 +19,8 @@ src/Codex.Web/tsconfig.tsbuildinfo
 src/Codex.Web/.env.local
 src/Codex.Web/.env.*.local
 ops/.env
+# Ariadne (Rust) build output and local index files
+/target/
+*.db
+*.db-journal
+*.db-wal
