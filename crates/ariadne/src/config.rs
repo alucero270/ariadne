@@ -137,7 +137,9 @@ impl Config {
 }
 
 fn endpoint(url: Option<String>, model: Option<String>, name: &str) -> Result<Option<Endpoint>> {
-    match (url, model) {
+    // `NAME=` in an env file arrives as Some(""); treat it as unset, like a missing line.
+    let set = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    match (set(url), set(model)) {
         (Some(url), Some(model)) => Ok(Some(Endpoint { url, model })),
         (None, None) => Ok(None),
         _ => bail!("set both ARIADNE_{name}_URL and ARIADNE_{name}_MODEL, or neither"),
@@ -191,6 +193,15 @@ mod tests {
             ..settings(Some("/tmp".into()), db.clone())
         };
         assert!(Config::new(too_many).is_err());
+        let blank = Settings {
+            context_url: Some(String::new()),
+            context_model: Some(" ".into()),
+            ..settings(Some("/tmp".into()), db.clone())
+        };
+        assert!(
+            Config::new(blank).unwrap().contextualizer.is_none(),
+            "empty env values mean unset"
+        );
         let tiny = Settings {
             max_chars: Some(10),
             ..settings(Some("/tmp".into()), db)

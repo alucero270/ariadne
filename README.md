@@ -18,7 +18,7 @@
 > ./target/release/ariadne --context-url http://127.0.0.1:8085 --context-model <chat model> ...
 > ```
 >
-> Endpoints: `GET /health`, `GET /search?q=&k=&mode=hybrid|bm25|dense` (`k` from 1 to 20, default 5 on every
+> Endpoints: `GET /health`, `GET /search?q=&k=&mode=hybrid|bm25|dense&rerank=true|false` (reranker off unless asked; one hit per file) (`k` from 1 to 20, default 5 on every
 > front end),
 > `GET /documents?path=` (404 for anything not indexed), `POST /reindex` (searches keep working
 > while it runs), and `POST /mcp` (JSON-RPC: tools `search` and `read_document`). Every endpoint

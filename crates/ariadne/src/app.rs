@@ -10,8 +10,9 @@ pub const DEFAULT_K: u64 = 5;
 pub const MAX_K: u64 = 20;
 pub const MAX_QUERY_CHARS: usize = 500;
 pub const MAX_PATH_CHARS: usize = 400;
-/// Served searches rerank by default; evaluation measures the same behaviour.
-const DEFAULT_RERANK: bool = true;
+/// Served searches skip the reranker unless the caller asks: on a CPU reranker it costs seconds
+/// per query and, on the Pantheon eval, bought no recall (#143). `ariadne eval` reports both.
+const DEFAULT_RERANK: bool = false;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -111,18 +112,15 @@ impl App {
         .await
     }
 
-    /// Measure retrieval with the same defaults searches are served with.
+    /// Measure retrieval in every mode, plus hybrid with the reranker when one is configured.
     pub async fn evaluate(
         self: &Arc<Self>,
         set: EvalSet,
         k: Option<u64>,
     ) -> Result<EvalReport, AppError> {
         let k = validate_k(k)?;
-        self.with_reader(move |idx| {
-            idx.evaluate(&set, k, DEFAULT_RERANK)
-                .map_err(AppError::Internal)
-        })
-        .await
+        self.with_reader(move |idx| idx.evaluate(&set, k).map_err(AppError::Internal))
+            .await
     }
 
     pub async fn reindex(self: &Arc<Self>) -> Result<BuildStats, AppError> {

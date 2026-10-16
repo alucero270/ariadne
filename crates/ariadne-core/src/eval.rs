@@ -26,7 +26,6 @@ pub struct ModeScore {
 pub struct EvalReport {
     pub k: usize,
     pub questions: usize,
-    pub rerank: bool,
     pub modes: BTreeMap<String, ModeScore>,
     pub misses: BTreeMap<String, Vec<String>>,
 }
@@ -36,23 +35,31 @@ fn round3(x: f64) -> f64 {
 }
 
 impl Index {
-    /// Score this index against `set` the way it serves: for each mode, the share of questions
-    /// whose top `k` contains an expected document (Recall@k) and the mean reciprocal rank of
-    /// the first one (MRR). Dense mode is measured only when an embedder is configured, and the
-    /// reranker runs exactly when `rerank` asks for it and one is configured.
-    pub fn evaluate(&mut self, set: &EvalSet, k: usize, rerank: bool) -> Result<EvalReport> {
+    /// Score this index against `set`: for each mode, the share of questions whose top `k`
+    /// contains an expected document (Recall@k) and the mean reciprocal rank of the first one
+    /// (MRR). Dense is measured only with an embedder, and `hybrid+rerank` only with a reranker,
+    /// so the reranker's cost can be weighed against what it buys.
+    pub fn evaluate(&mut self, set: &EvalSet, k: usize) -> Result<EvalReport> {
         let mut report = EvalReport {
             k,
             questions: set.questions.len(),
-            rerank: rerank && self.has_reranker(),
             modes: BTreeMap::new(),
             misses: BTreeMap::new(),
         };
+        let mut runs: Vec<(String, SearchOptions)> = Vec::new();
         for mode in Mode::ALL {
             if mode == Mode::Dense && !self.has_embedder() {
                 continue;
             }
-            let opts = SearchOptions::new(k, mode, rerank);
+            runs.push((mode.name().into(), SearchOptions::new(k, mode, false)));
+        }
+        if self.has_reranker() {
+            runs.push((
+                "hybrid+rerank".into(),
+                SearchOptions::new(k, Mode::Hybrid, true),
+            ));
+        }
+        for (name, opts) in runs {
             let (mut found, mut rr, mut misses) = (0usize, 0.0f64, Vec::new());
             for q in &set.questions {
                 let hits = self.search(&q.q, &opts)?;
@@ -69,8 +76,8 @@ impl Index {
                 recall_at_k: round3(found as f64 / n),
                 mrr: round3(rr / n),
             };
-            report.modes.insert(mode.name().into(), score);
-            report.misses.insert(mode.name().into(), misses);
+            report.modes.insert(name.clone(), score);
+            report.misses.insert(name, misses);
         }
         Ok(report)
     }
@@ -79,7 +86,8 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::tests::Fixture;
+    use crate::index::tests::{Fixture, HashEmbedder, ReverseReranker};
+    use crate::Models;
 
     #[test]
     fn scores_hits_and_misses() {
@@ -90,7 +98,7 @@ mod tests {
             r#"{"questions":[{"q":"moonraker 7125","expect":["systems/fabrication/qidi.md"]},{"q":"zzz","expect":["nope.md"]}]}"#,
         )
         .unwrap();
-        let report = idx.evaluate(&set, 1, false).unwrap();
+        let report = idx.evaluate(&set, 1).unwrap();
         assert_eq!(
             report.modes["hybrid"],
             ModeScore {
@@ -99,13 +107,34 @@ mod tests {
             }
         );
         assert_eq!(report.misses["hybrid"], vec!["zzz".to_string()]);
-        assert!(!report.rerank);
-        assert_eq!(report.modes.len(), 3);
+        assert_eq!(
+            report.modes.len(),
+            3,
+            "no reranker, so no hybrid+rerank row"
+        );
 
         let g = Fixture::new();
         let mut keyword_only = g.open(false);
         keyword_only.build().unwrap();
-        let report = keyword_only.evaluate(&set, 1, true).unwrap();
+        let report = keyword_only.evaluate(&set, 1).unwrap();
         assert!(!report.modes.contains_key("dense"));
+    }
+
+    #[test]
+    fn reports_hybrid_with_and_without_the_reranker() {
+        let f = Fixture::new();
+        let mut idx = f.open_with(Models {
+            embedder: Some(Box::new(HashEmbedder)),
+            reranker: Some(Box::new(ReverseReranker)),
+            contextualizer: None,
+        });
+        idx.build().unwrap();
+        let set: EvalSet = serde_json::from_str(
+            r#"{"questions":[{"q":"moonraker 7125","expect":["systems/fabrication/qidi.md"]}]}"#,
+        )
+        .unwrap();
+        let report = idx.evaluate(&set, 5).unwrap();
+        let names: Vec<_> = report.modes.keys().map(String::as_str).collect();
+        assert_eq!(names, ["bm25", "dense", "hybrid", "hybrid+rerank"]);
     }
 }

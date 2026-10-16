@@ -122,14 +122,14 @@ pub struct SearchOptions {
 
 impl SearchOptions {
     /// `k` hits in `mode`; `rerank` applies the reranker when one is configured. Each document
-    /// contributes at most two hits.
+    /// contributes at most one hit, so `k` hits name `k` different files.
     pub fn new(k: usize, mode: Mode, rerank: bool) -> Self {
         Self {
             k,
             mode,
             rerank,
             candidates: 40,
-            max_per_document: Some(2),
+            max_per_document: Some(1),
         }
     }
 }
@@ -678,7 +678,7 @@ pub(crate) mod tests {
         }
     }
 
-    struct ReverseReranker;
+    pub(crate) struct ReverseReranker;
 
     impl Reranker for ReverseReranker {
         fn name(&self) -> String {
@@ -1032,7 +1032,7 @@ pub(crate) mod tests {
         idx.build().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         let hits = idx.search("zebracrossing", &opts(Mode::Bm25, 10)).unwrap();
-        assert_eq!(hits.len(), 3, "four chunks, at most two per document");
+        assert_eq!(hits.len(), 2, "four chunks in two documents, one hit each");
         let qidi = hits.iter().find(|h| h.path.contains("qidi")).unwrap();
         assert_eq!(qidi.context, "From Qidi Plus 4: zebracrossing context.");
     }
