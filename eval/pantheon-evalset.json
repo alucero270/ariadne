@@ -1,205 +1,35 @@
 {
   "description": "Questions a user or agent would ask about Pantheon, phrased naturally rather than copied from the docs. 'expect' lists every file that genuinely answers the question; a hit on any of them counts.",
   "questions": [
-    {
-      "q": "which ports does the 3d printer expose",
-      "expect": [
-        "systems/fabrication/devices/qidi-plus-4.md",
-        "systems/fabrication/README.md"
-      ]
-    },
-    {
-      "q": "why can't the printer answer traffic from other networks",
-      "expect": [
-        "systems/fabrication/devices/qidi-plus-4.md",
-        "systems/fabrication/README.md"
-      ]
-    },
-    {
-      "q": "what is the agent allowed to do with the printer",
-      "expect": [
-        "systems/fabrication/AGENTS.md"
-      ]
-    },
-    {
-      "q": "chamber temperature reads too low",
-      "expect": [
-        "systems/fabrication/devices/qidi-plus-4.md"
-      ]
-    },
-    {
-      "q": "list of vlans and their ids",
-      "expect": [
-        "systems/network/architecture/vlan-design.md"
-      ]
-    },
-    {
-      "q": "how do I reach the homelab when I'm away from home",
-      "expect": [
-        "systems/network/architecture/tailscale-remote-access.md",
-        "systems/network/procedures/tailscale-remote-access.md"
-      ]
-    },
-    {
-      "q": "check that firewall rules between vlans actually block traffic",
-      "expect": [
-        "systems/network/procedures/vlan-firewall-validation.md"
-      ]
-    },
-    {
-      "q": "what to check after the power goes out",
-      "expect": [
-        "systems/network/procedures/power-outage-recovery-validation-2026-08-05.md"
-      ]
-    },
-    {
-      "q": "set up a new workstation on the network",
-      "expect": [
-        "systems/network/procedures/workstation-onboarding.md"
-      ]
-    },
-    {
-      "q": "rebuild the network from scratch",
-      "expect": [
-        "systems/network/procedures/network-rebuild.md",
-        "systems/network/procedures/rebuild-network.md"
-      ]
-    },
-    {
-      "q": "local dns names plan",
-      "expect": [
-        "systems/network/architecture/dns-plan.md"
-      ]
-    },
-    {
-      "q": "why is prometheus treated as disposable",
-      "expect": [
-        "decisions/ADR-003-disposable-compute-prometheus.md"
-      ]
-    },
-    {
-      "q": "decision to route all web traffic through one reverse proxy",
-      "expect": [
-        "decisions/ADR-007-centralized-ingress-on-prometheus.md"
-      ]
-    },
-    {
-      "q": "where does persistent data live",
-      "expect": [
-        "decisions/ADR-002-atlas-as-storage.md",
-        "decisions/ADR-005-atlas-share-storage-model.md",
-        "systems/prometheus/architecture/storage-authority-map.md"
-      ]
-    },
-    {
-      "q": "zero trust security approach",
-      "expect": [
-        "decisions/ADR-001-zero-trust-lite.md",
-        "systems/network/architecture/security-model.md"
-      ]
-    },
-    {
-      "q": "is anemoi authenticated",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/core/anemoi/anemoi.md"
-      ]
-    },
-    {
-      "q": "which speech to text model does the voice assistant use",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/voice-agent/voice-agent.md",
-        "systems/prometheus/automation/docker/stacks/voice-agent/README.md"
-      ]
-    },
-    {
-      "q": "voice replies are slow, how do I debug it",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/voice-agent/procedures/voice-agent-latency-troubleshooting.md",
-        "systems/prometheus/procedures/voice-agent-latency-troubleshooting.md"
-      ]
-    },
-    {
-      "q": "run speech on the laptop but keep the language model on the server",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/voice-agent/procedures/voice-agent-edge-split.md",
-        "decisions/ADR-012-voice-runs-on-client-devices.md"
-      ]
-    },
-    {
-      "q": "how are models swapped in and out of the gpu",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/core/llama-swap/llama-swap.md",
-        "systems/prometheus/services/llama-swap.md",
-        "decisions/ADR-011-llama-swap-backend-turboquant.md"
-      ]
-    },
-    {
-      "q": "speculative decoding draft model results",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/core/llama-swap/llama-swap.md",
-        "systems/prometheus/opt/stacks/ai/core/llama-swap/reddit-post-dflash2-vs-mtp.md",
-        "systems/prometheus/opt/stacks/ai/core/llama-swap/config/README.md"
-      ]
-    },
-    {
-      "q": "private web search engine for the agents",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/searxng/searxng.md",
-        "systems/prometheus/opt/stacks/ai/searxng/README.md"
-      ]
-    },
-    {
-      "q": "connect web search to open webui",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/searxng/procedures/searxng-openwebui-integration.md",
-        "systems/prometheus/procedures/searxng-openwebui-integration.md"
-      ]
-    },
-    {
-      "q": "generate a 3d mesh from an image",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/core/comfyui/procedures/hunyuan3d-first-lesson.md"
-      ]
-    },
-    {
-      "q": "where are comfyui models stored",
-      "expect": [
-        "systems/prometheus/opt/stacks/ai/core/comfyui/procedures/ssd-model-library.md",
-        "decisions/ADR-006-comfyui-storage-constraints.md"
-      ]
-    },
-    {
-      "q": "network map dashboard with node status",
-      "expect": [
-        "systems/prometheus/opt/stacks/homelable/homelable.md",
-        "systems/prometheus/services/homelable.md"
-      ]
-    },
-    {
-      "q": "add a new https route for a service",
-      "expect": [
-        "systems/prometheus/opt/stacks/ingress/traefik/traefik.md",
-        "systems/prometheus/opt/stacks/ingress/traefik/config/README.md",
-        "systems/prometheus/procedures/reverse-proxy.md"
-      ]
-    },
-    {
-      "q": "nextcloud behind the reverse proxy",
-      "expect": [
-        "systems/atlas/procedures/nextcloud-reverse-proxy.md"
-      ]
-    },
-    {
-      "q": "recover atlas after a failure",
-      "expect": [
-        "systems/atlas/procedures/atlas-recovery.md"
-      ]
-    },
-    {
-      "q": "jarvis assistant build phases",
-      "expect": [
-        "systems/prometheus/architecture/jarvis-program.md"
-      ]
-    }
+    {"q": "which ports does the 3d printer expose", "expect": ["systems/fabrication/devices/qidi-plus-4.md", "systems/fabrication/README.md"]},
+    {"q": "why can't the printer answer traffic from other networks", "expect": ["systems/fabrication/devices/qidi-plus-4.md", "systems/fabrication/README.md"]},
+    {"q": "what is the agent allowed to do with the printer", "expect": ["systems/fabrication/AGENTS.md"]},
+    {"q": "chamber temperature reads too low", "expect": ["systems/fabrication/devices/qidi-plus-4.md"]},
+    {"q": "list of vlans and their ids", "expect": ["systems/network/architecture/vlan-design.md"]},
+    {"q": "how do I reach the homelab when I'm away from home", "expect": ["systems/network/architecture/tailscale-remote-access.md", "systems/network/procedures/tailscale-remote-access.md"]},
+    {"q": "check that firewall rules between vlans actually block traffic", "expect": ["systems/network/procedures/vlan-firewall-validation.md"]},
+    {"q": "what to check after the power goes out", "expect": ["systems/network/procedures/power-outage-recovery-validation-2026-08-05.md"]},
+    {"q": "set up a new workstation on the network", "expect": ["systems/network/procedures/workstation-onboarding.md"]},
+    {"q": "rebuild the network from scratch", "expect": ["systems/network/procedures/network-rebuild.md", "systems/network/procedures/rebuild-network.md"]},
+    {"q": "local dns names plan", "expect": ["systems/network/architecture/dns-plan.md"]},
+    {"q": "why is prometheus treated as disposable", "expect": ["decisions/ADR-003-disposable-compute-prometheus.md"]},
+    {"q": "decision to route all web traffic through one reverse proxy", "expect": ["decisions/ADR-007-centralized-ingress-on-prometheus.md"]},
+    {"q": "where does persistent data live", "expect": ["decisions/ADR-002-atlas-as-storage.md", "decisions/ADR-005-atlas-share-storage-model.md", "systems/prometheus/architecture/storage-authority-map.md"]},
+    {"q": "zero trust security approach", "expect": ["decisions/ADR-001-zero-trust-lite.md", "systems/network/architecture/security-model.md"]},
+    {"q": "is anemoi authenticated", "expect": ["systems/prometheus/opt/stacks/ai/core/anemoi/anemoi.md"]},
+    {"q": "which speech to text model does the voice assistant use", "expect": ["systems/prometheus/opt/stacks/ai/voice-agent/voice-agent.md", "systems/prometheus/automation/docker/stacks/voice-agent/README.md"]},
+    {"q": "voice replies are slow, how do I debug it", "expect": ["systems/prometheus/opt/stacks/ai/voice-agent/procedures/voice-agent-latency-troubleshooting.md", "systems/prometheus/procedures/voice-agent-latency-troubleshooting.md"]},
+    {"q": "run speech on the laptop but keep the language model on the server", "expect": ["systems/prometheus/opt/stacks/ai/voice-agent/procedures/voice-agent-edge-split.md", "decisions/ADR-012-voice-runs-on-client-devices.md"]},
+    {"q": "how are models swapped in and out of the gpu", "expect": ["systems/prometheus/opt/stacks/ai/core/llama-swap/llama-swap.md", "systems/prometheus/services/llama-swap.md", "decisions/ADR-011-llama-swap-backend-turboquant.md"]},
+    {"q": "speculative decoding draft model results", "expect": ["systems/prometheus/opt/stacks/ai/core/llama-swap/llama-swap.md", "systems/prometheus/opt/stacks/ai/core/llama-swap/reddit-post-dflash2-vs-mtp.md", "systems/prometheus/opt/stacks/ai/core/llama-swap/config/README.md"]},
+    {"q": "private web search engine for the agents", "expect": ["systems/prometheus/opt/stacks/ai/searxng/searxng.md", "systems/prometheus/opt/stacks/ai/searxng/README.md"]},
+    {"q": "connect web search to open webui", "expect": ["systems/prometheus/opt/stacks/ai/searxng/procedures/searxng-openwebui-integration.md", "systems/prometheus/procedures/searxng-openwebui-integration.md"]},
+    {"q": "generate a 3d mesh from an image", "expect": ["systems/prometheus/opt/stacks/ai/core/comfyui/procedures/hunyuan3d-first-lesson.md"]},
+    {"q": "where are comfyui models stored", "expect": ["systems/prometheus/opt/stacks/ai/core/comfyui/procedures/ssd-model-library.md", "decisions/ADR-006-comfyui-storage-constraints.md"]},
+    {"q": "network map dashboard with node status", "expect": ["systems/prometheus/opt/stacks/homelable/homelable.md", "systems/prometheus/services/homelable.md"]},
+    {"q": "add a new https route for a service", "expect": ["systems/prometheus/opt/stacks/ingress/traefik/traefik.md", "systems/prometheus/opt/stacks/ingress/traefik/config/README.md", "systems/prometheus/procedures/reverse-proxy.md"]},
+    {"q": "nextcloud behind the reverse proxy", "expect": ["systems/atlas/procedures/nextcloud-reverse-proxy.md"]},
+    {"q": "recover atlas after a failure", "expect": ["systems/atlas/procedures/atlas-recovery.md"]},
+    {"q": "jarvis assistant build phases", "expect": ["systems/prometheus/architecture/jarvis-program.md"]}
   ]
 }
