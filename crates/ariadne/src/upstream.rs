@@ -304,7 +304,7 @@ mod tests {
                 .collect();
             json!({"data": data})
         });
-        let mut e = HttpEmbedder::new(&format!("{url}/"), "m", "LOCAL");
+        let mut e = HttpEmbedder::new(&format!("{url}/"), "m", "test-key");
         e.batch_size = 2;
         let vecs = e.embed(&["a".into(), "b".into(), "c".into()]).unwrap();
         // Each batch restarts at index 0; replies arrive reversed and are put back in order.
@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert!(seen
             .iter()
-            .all(|(p, a, _)| p == "/v1/embeddings" && a == "Bearer LOCAL"));
+            .all(|(p, a, _)| p == "/v1/embeddings" && a == "Bearer test-key"));
     }
 
     #[test]
@@ -329,13 +329,13 @@ mod tests {
         let (url, seen) = serve(
             |_, _| json!({"choices": [{"message": {"content": "<think>hmm</think> About the printer."}}]}),
         );
-        let c = HttpContextualizer::new(&url, "small", "LOCAL", 4);
+        let c = HttpContextualizer::new(&url, "small", "test-key", 4);
         let context = c.describe("# Qidi\n\nwhole doc", "the chunk").unwrap();
         assert_eq!(context, "About the printer.");
         assert_eq!((c.name(), c.parallelism()), ("chat:small".to_string(), 4));
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].0, "/v1/chat/completions");
-        assert_eq!(seen[0].1, "Bearer LOCAL");
+        assert_eq!(seen[0].1, "Bearer test-key");
         let body: serde_json::Value = serde_json::from_str(&seen[0].2).unwrap();
         let prompt = body["messages"][0]["content"].as_str().unwrap();
         assert!(prompt.contains("whole doc") && prompt.contains("<chunk>\nthe chunk\n</chunk>"));
