@@ -19,7 +19,7 @@
     {"q": "is anemoi authenticated", "expect": ["systems/prometheus/opt/stacks/ai/core/anemoi/anemoi.md"]},
     {"q": "which speech to text model does the voice assistant use", "expect": ["systems/prometheus/opt/stacks/ai/voice-agent/voice-agent.md", "systems/prometheus/automation/docker/stacks/voice-agent/README.md"]},
     {"q": "voice replies are slow, how do I debug it", "expect": ["systems/prometheus/opt/stacks/ai/voice-agent/procedures/voice-agent-latency-troubleshooting.md", "systems/prometheus/procedures/voice-agent-latency-troubleshooting.md"]},
-    {"q": "run speech on the laptop but keep the language model on the server", "expect": ["systems/prometheus/opt/stacks/ai/voice-agent/procedures/voice-agent-edge-split.md"]},
+    {"q": "run speech on the laptop but keep the language model on the server", "expect": ["systems/prometheus/opt/stacks/ai/voice-agent/procedures/voice-agent-edge-split.md", "decisions/ADR-012-voice-runs-on-client-devices.md"]},
     {"q": "how are models swapped in and out of the gpu", "expect": ["systems/prometheus/opt/stacks/ai/core/llama-swap/llama-swap.md", "systems/prometheus/services/llama-swap.md", "decisions/ADR-011-llama-swap-backend-turboquant.md"]},
     {"q": "speculative decoding draft model results", "expect": ["systems/prometheus/opt/stacks/ai/core/llama-swap/llama-swap.md", "systems/prometheus/opt/stacks/ai/core/llama-swap/reddit-post-dflash2-vs-mtp.md", "systems/prometheus/opt/stacks/ai/core/llama-swap/config/README.md"]},
     {"q": "private web search engine for the agents", "expect": ["systems/prometheus/opt/stacks/ai/searxng/searxng.md", "systems/prometheus/opt/stacks/ai/searxng/README.md"]},
