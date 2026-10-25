@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
                 k,
                 mode,
                 rerank: None,
+                attach: None,
             };
             for h in app.search(request).await? {
                 println!("{:.4}  [[{}]]  {:?}", h.score, h.reference, h.ranks);

@@ -97,6 +97,12 @@ impl Retriever {
 /// candidates to choose from even when `k` is small.
 const MIN_FUSION_POOL: usize = 20;
 
+/// Next-best sections of the top hit's own file appended to its text, and their character
+/// budget. One hit per file keeps results diverse, but the file's best-ranked section can
+/// miss the asked-for fact while a sibling holds it (pantheon#322).
+const ATTACH_SECTIONS: usize = 2;
+const ATTACH_CHARS: usize = 1600;
+
 impl std::str::FromStr for Mode {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -118,11 +124,14 @@ pub struct SearchOptions {
     candidates: usize,
     /// At most this many hits per document; `None` for no cap.
     max_per_document: Option<usize>,
+    /// Next-best sections of the top hit's file appended to its text; 0 to turn off.
+    attach_sections: usize,
 }
 
 impl SearchOptions {
     /// `k` hits in `mode`; `rerank` applies the reranker when one is configured. Each document
-    /// contributes at most one hit, so `k` hits name `k` different files.
+    /// contributes at most one hit, so `k` hits name `k` different files. The top hit also
+    /// carries up to two more sections of its own file.
     pub fn new(k: usize, mode: Mode, rerank: bool) -> Self {
         Self {
             k,
@@ -130,6 +139,15 @@ impl SearchOptions {
             rerank,
             candidates: 40,
             max_per_document: Some(1),
+            attach_sections: ATTACH_SECTIONS,
+        }
+    }
+
+    /// Same options with `n` attached sections on the top hit (0 turns attaching off).
+    pub fn with_attached_sections(self, n: usize) -> Self {
+        Self {
+            attach_sections: n,
+            ..self
         }
     }
 }
@@ -452,9 +470,9 @@ impl Index {
                 .collect::<Vec<_>>(),
         );
         let mut hits = fused
-            .into_iter()
+            .iter()
             .take(opts.k.max(MIN_FUSION_POOL))
-            .map(|(id, score)| self.to_hit(id, score, &rankings))
+            .map(|&(id, score)| self.to_hit(id, score, &rankings))
             .collect::<Result<Vec<_>>>()?;
         if opts.rerank {
             self.rerank(query, &mut hits)?;
@@ -463,7 +481,39 @@ impl Index {
             hits = cap_per_key(hits, cap, |h| h.path.as_str());
         }
         hits.truncate(opts.k);
+        if let Some(top) = hits.first_mut() {
+            self.attach_sections(top, &fused, opts.attach_sections)?;
+        }
         Ok(hits)
+    }
+
+    /// Appends up to `max` other sections of `top`'s file to its text, best-ranked first, each
+    /// under its own citation, within `ATTACH_CHARS`. Only sections that matched the query are
+    /// considered, so an unrelated part of a long file is never attached.
+    fn attach_sections(&self, top: &mut Hit, fused: &[(i64, f64)], max: usize) -> Result<()> {
+        let mut budget = ATTACH_CHARS;
+        let mut added = 0;
+        for &(id, _) in fused {
+            if added == max || budget == 0 {
+                break;
+            }
+            if id == top.id {
+                continue;
+            }
+            let c = store::chunk(&self.conn, id)?;
+            if c.path != top.path {
+                continue;
+            }
+            let body: String = c.body.chars().take(budget).collect();
+            budget -= body.chars().count();
+            top.text.push_str(&format!(
+                "\n\n[also in this file: {}]\n{}",
+                reference(&c.path, &c.anchor),
+                body
+            ));
+            added += 1;
+        }
+        Ok(())
     }
 
     /// The full text of an indexed document, or `None` if `path` isn't one. The `.md` suffix
@@ -870,6 +920,44 @@ pub(crate) mod tests {
             .unwrap();
         let paths: HashSet<_> = capped.iter().map(|h| h.path.clone()).collect();
         assert_eq!(paths.len(), capped.len());
+    }
+
+    #[test]
+    fn top_hit_carries_next_sections_of_its_own_file() {
+        let f = Fixture::new();
+        let mut idx = f.open(true);
+        idx.build().unwrap();
+        let opts = SearchOptions::new(5, Mode::Hybrid, false);
+
+        let hits = idx.search("qidi printer intro", &opts).unwrap();
+        let top = &hits[0];
+        assert!(top.path.ends_with("qidi.md"), "{top:?}");
+        assert!(
+            top.text
+                .contains("[also in this file: systems/fabrication/qidi#"),
+            "{}",
+            top.text
+        );
+        assert!(top.text.matches("[also in this file:").count() <= ATTACH_SECTIONS);
+        // Only the top hit carries siblings, and it never repeats itself.
+        assert!(hits[1..]
+            .iter()
+            .all(|h| !h.text.contains("[also in this file:")));
+        assert!(!top
+            .text
+            .contains(&format!("[also in this file: {}]", top.reference)));
+
+        let one = idx
+            .search(
+                "qidi printer intro",
+                &opts.clone().with_attached_sections(1),
+            )
+            .unwrap();
+        assert_eq!(one[0].text.matches("[also in this file:").count(), 1);
+        let off = idx
+            .search("qidi printer intro", &opts.with_attached_sections(0))
+            .unwrap();
+        assert!(!off[0].text.contains("[also in this file:"));
     }
 
     #[test]

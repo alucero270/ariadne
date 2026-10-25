@@ -42,7 +42,12 @@ pub struct SearchRequest {
     pub k: Option<u64>,
     pub mode: Option<String>,
     pub rerank: Option<bool>,
+    /// Extra sections of the top hit's file to attach, 0 to `MAX_ATTACH`; default 2.
+    pub attach: Option<u64>,
 }
+
+/// Most sibling sections a caller may ask to attach to the top hit.
+pub const MAX_ATTACH: u64 = 3;
 
 impl SearchRequest {
     fn validate(self) -> Result<(String, SearchOptions), AppError> {
@@ -59,7 +64,15 @@ impl SearchRequest {
                 .parse::<Mode>()
                 .map_err(|e| AppError::BadRequest(e.to_string()))?,
         };
-        let opts = SearchOptions::new(k, mode, self.rerank.unwrap_or(DEFAULT_RERANK));
+        let mut opts = SearchOptions::new(k, mode, self.rerank.unwrap_or(DEFAULT_RERANK));
+        if let Some(n) = self.attach {
+            if n > MAX_ATTACH {
+                return Err(AppError::BadRequest(format!(
+                    "attach must be from 0 to {MAX_ATTACH}"
+                )));
+            }
+            opts = opts.with_attached_sections(n as usize);
+        }
         Ok((query, opts))
     }
 }
@@ -219,6 +232,10 @@ pub(crate) mod tests {
             },
             SearchRequest {
                 mode: Some("bogus".into()),
+                ..req("x")
+            },
+            SearchRequest {
+                attach: Some(MAX_ATTACH + 1),
                 ..req("x")
             },
         ] {
