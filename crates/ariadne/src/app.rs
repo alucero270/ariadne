@@ -42,12 +42,10 @@ pub struct SearchRequest {
     pub k: Option<u64>,
     pub mode: Option<String>,
     pub rerank: Option<bool>,
-    /// Extra sections of the top hit's file to attach, 0 to `MAX_ATTACH`; default 2.
-    pub attach: Option<u64>,
+    /// `"file"` to return the rest of the top hit's file when it is short (parent-document
+    /// retrieval); omitted or `"none"` for single sections.
+    pub expand: Option<String>,
 }
-
-/// Most sibling sections a caller may ask to attach to the top hit.
-pub const MAX_ATTACH: u64 = 3;
 
 impl SearchRequest {
     fn validate(self) -> Result<(String, SearchOptions), AppError> {
@@ -64,15 +62,17 @@ impl SearchRequest {
                 .parse::<Mode>()
                 .map_err(|e| AppError::BadRequest(e.to_string()))?,
         };
-        let mut opts = SearchOptions::new(k, mode, self.rerank.unwrap_or(DEFAULT_RERANK));
-        if let Some(n) = self.attach {
-            if n > MAX_ATTACH {
+        let expand_file = match self.expand.as_deref() {
+            None | Some("none") => false,
+            Some("file") => true,
+            Some(other) => {
                 return Err(AppError::BadRequest(format!(
-                    "attach must be from 0 to {MAX_ATTACH}"
-                )));
+                    "unknown expand {other}; use file or none"
+                )))
             }
-            opts = opts.with_attached_sections(n as usize);
-        }
+        };
+        let opts = SearchOptions::new(k, mode, self.rerank.unwrap_or(DEFAULT_RERANK))
+            .with_expand_file(expand_file);
         Ok((query, opts))
     }
 }
@@ -235,7 +235,7 @@ pub(crate) mod tests {
                 ..req("x")
             },
             SearchRequest {
-                attach: Some(MAX_ATTACH + 1),
+                expand: Some("bogus".into()),
                 ..req("x")
             },
         ] {

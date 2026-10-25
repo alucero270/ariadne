@@ -97,11 +97,11 @@ impl Retriever {
 /// candidates to choose from even when `k` is small.
 const MIN_FUSION_POOL: usize = 20;
 
-/// Next-best sections of the top hit's own file appended to its text, and their character
-/// budget. One hit per file keeps results diverse, but the file's best-ranked section can
-/// miss the asked-for fact while a sibling holds it (pantheon#322).
-const ATTACH_SECTIONS: usize = 2;
-const ATTACH_CHARS: usize = 1600;
+/// Largest file, in characters of section text, that `expand_file` returns whole. Search ranks
+/// sections, but a file's best-matching section can miss the asked-for fact while another
+/// section of the same short file holds it (pantheon#322). Parent-document retrieval: match on
+/// sections, answer from the file. Longer files keep the single section.
+pub const EXPAND_FILE_CHARS: usize = 6000;
 
 impl std::str::FromStr for Mode {
     type Err = anyhow::Error;
@@ -124,14 +124,13 @@ pub struct SearchOptions {
     candidates: usize,
     /// At most this many hits per document; `None` for no cap.
     max_per_document: Option<usize>,
-    /// Next-best sections of the top hit's file appended to its text; 0 to turn off.
-    attach_sections: usize,
+    /// Append the rest of the top hit's file, in document order, when the file is short.
+    expand_file: bool,
 }
 
 impl SearchOptions {
     /// `k` hits in `mode`; `rerank` applies the reranker when one is configured. Each document
-    /// contributes at most one hit, so `k` hits name `k` different files. The top hit also
-    /// carries up to two more sections of its own file.
+    /// contributes at most one hit, so `k` hits name `k` different files.
     pub fn new(k: usize, mode: Mode, rerank: bool) -> Self {
         Self {
             k,
@@ -139,14 +138,14 @@ impl SearchOptions {
             rerank,
             candidates: 40,
             max_per_document: Some(1),
-            attach_sections: ATTACH_SECTIONS,
+            expand_file: false,
         }
     }
 
-    /// Same options with `n` attached sections on the top hit (0 turns attaching off).
-    pub fn with_attached_sections(self, n: usize) -> Self {
+    /// Same options, with the top hit carrying the rest of its file when the file is short.
+    pub fn with_expand_file(self, expand_file: bool) -> Self {
         Self {
-            attach_sections: n,
+            expand_file,
             ..self
         }
     }
@@ -470,9 +469,9 @@ impl Index {
                 .collect::<Vec<_>>(),
         );
         let mut hits = fused
-            .iter()
+            .into_iter()
             .take(opts.k.max(MIN_FUSION_POOL))
-            .map(|&(id, score)| self.to_hit(id, score, &rankings))
+            .map(|(id, score)| self.to_hit(id, score, &rankings))
             .collect::<Result<Vec<_>>>()?;
         if opts.rerank {
             self.rerank(query, &mut hits)?;
@@ -481,37 +480,33 @@ impl Index {
             hits = cap_per_key(hits, cap, |h| h.path.as_str());
         }
         hits.truncate(opts.k);
-        if let Some(top) = hits.first_mut() {
-            self.attach_sections(top, &fused, opts.attach_sections)?;
+        if opts.expand_file {
+            if let Some(top) = hits.first_mut() {
+                self.expand_file(top)?;
+            }
         }
         Ok(hits)
     }
 
-    /// Appends up to `max` other sections of `top`'s file to its text, best-ranked first, each
-    /// under its own citation, within `ATTACH_CHARS`. Only sections that matched the query are
-    /// considered, so an unrelated part of a long file is never attached.
-    fn attach_sections(&self, top: &mut Hit, fused: &[(i64, f64)], max: usize) -> Result<()> {
-        let mut budget = ATTACH_CHARS;
-        let mut added = 0;
-        for &(id, _) in fused {
-            if added == max || budget == 0 {
-                break;
+    /// Appends every other section of `top`'s file, in document order and each under its own
+    /// citation, when the whole file fits in `EXPAND_FILE_CHARS`. Otherwise `top` is unchanged.
+    fn expand_file(&self, top: &mut Hit) -> Result<()> {
+        let sections = store::file_chunks(&self.conn, &top.path)?;
+        let total: usize = sections
+            .iter()
+            .map(|(_, _, body)| body.chars().count())
+            .sum();
+        if sections.len() < 2 || total > EXPAND_FILE_CHARS {
+            return Ok(());
+        }
+        for (id, anchor, body) in sections {
+            if id != top.id {
+                top.text.push_str(&format!(
+                    "\n\n[also in this file: {}]\n{}",
+                    reference(&top.path, &anchor),
+                    body
+                ));
             }
-            if id == top.id {
-                continue;
-            }
-            let c = store::chunk(&self.conn, id)?;
-            if c.path != top.path {
-                continue;
-            }
-            let body: String = c.body.chars().take(budget).collect();
-            budget -= body.chars().count();
-            top.text.push_str(&format!(
-                "\n\n[also in this file: {}]\n{}",
-                reference(&c.path, &c.anchor),
-                body
-            ));
-            added += 1;
         }
         Ok(())
     }
@@ -923,41 +918,50 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn top_hit_carries_next_sections_of_its_own_file() {
+    fn expand_file_returns_the_rest_of_a_short_file_in_document_order() {
         let f = Fixture::new();
         let mut idx = f.open(true);
         idx.build().unwrap();
         let opts = SearchOptions::new(5, Mode::Hybrid, false);
 
-        let hits = idx.search("qidi printer intro", &opts).unwrap();
+        // Off by default: one section per hit.
+        let plain = idx.search("qidi printer intro", &opts).unwrap();
+        assert!(!plain[0].text.contains("[also in this file:"));
+
+        let hits = idx
+            .search("qidi printer intro", &opts.clone().with_expand_file(true))
+            .unwrap();
         let top = &hits[0];
         assert!(top.path.ends_with("qidi.md"), "{top:?}");
-        assert!(
-            top.text
-                .contains("[also in this file: systems/fabrication/qidi#"),
-            "{}",
-            top.text
-        );
-        assert!(top.text.matches("[also in this file:").count() <= ATTACH_SECTIONS);
-        // Only the top hit carries siblings, and it never repeats itself.
-        assert!(hits[1..]
-            .iter()
-            .all(|h| !h.text.contains("[also in this file:")));
+        // The matched intro alone has no port; the expanded file does, sections in order.
+        let net = top
+            .text
+            .find("Moonraker listens on port 7125")
+            .expect("network section");
+        let fw = top
+            .text
+            .find("Only USER VLAN 20")
+            .expect("firewall section");
+        assert!(net < fw, "{}", top.text);
         assert!(!top
             .text
             .contains(&format!("[also in this file: {}]", top.reference)));
+        assert!(hits[1..]
+            .iter()
+            .all(|h| !h.text.contains("[also in this file:")));
 
-        let one = idx
-            .search(
-                "qidi printer intro",
-                &opts.clone().with_attached_sections(1),
-            )
+        // A file over the limit keeps its single section.
+        let big = format!(
+            "# Big\n\n## Alpha\n\nzebra marker\n\n## Beta\n\n{}\n",
+            "word ".repeat(EXPAND_FILE_CHARS / 4)
+        );
+        f.write("big.md", &big);
+        idx.build().unwrap();
+        let hits = idx
+            .search("zebra marker", &opts.with_expand_file(true))
             .unwrap();
-        assert_eq!(one[0].text.matches("[also in this file:").count(), 1);
-        let off = idx
-            .search("qidi printer intro", &opts.with_attached_sections(0))
-            .unwrap();
-        assert!(!off[0].text.contains("[also in this file:"));
+        assert!(hits[0].path.ends_with("big.md"));
+        assert!(!hits[0].text.contains("[also in this file:"));
     }
 
     #[test]
