@@ -491,14 +491,11 @@ impl Index {
     /// Appends every other section of `top`'s file, in document order and each under its own
     /// citation, when the whole file fits in `EXPAND_FILE_CHARS`. Otherwise `top` is unchanged.
     fn expand_file(&self, top: &mut Hit) -> Result<()> {
-        let sections = store::file_chunks(&self.conn, &top.path)?;
-        let total: usize = sections
-            .iter()
-            .map(|(_, _, body)| body.chars().count())
-            .sum();
-        if sections.len() < 2 || total > EXPAND_FILE_CHARS {
+        let (count, chars) = store::file_size(&self.conn, &top.path)?;
+        if count < 2 || chars > EXPAND_FILE_CHARS {
             return Ok(());
         }
+        let sections = store::file_chunks(&self.conn, &top.path)?;
         for (id, anchor, body) in sections {
             if id != top.id {
                 top.text.push_str(&format!(

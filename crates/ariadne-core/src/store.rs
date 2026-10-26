@@ -180,6 +180,17 @@ pub(crate) fn chunk(conn: &Connection, id: i64) -> Result<StoredChunk> {
     )?)
 }
 
+/// Number of chunks in `path` and their total body length in characters, computed in SQLite so
+/// a large file's text is never loaded just to learn it is too large.
+pub(crate) fn file_size(conn: &Connection, path: &str) -> Result<(usize, usize)> {
+    let (n, chars): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(LENGTH(body)), 0) FROM chunks WHERE path=?1",
+        [path],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((n as usize, chars as usize))
+}
+
 /// Every chunk of `path` in document order, as (id, anchor, body).
 pub(crate) fn file_chunks(conn: &Connection, path: &str) -> Result<Vec<(i64, String, String)>> {
     let mut stmt =
