@@ -97,6 +97,12 @@ impl Retriever {
 /// candidates to choose from even when `k` is small.
 const MIN_FUSION_POOL: usize = 20;
 
+/// Largest file, in characters of section text, that `expand_file` returns whole. Search ranks
+/// sections, but a file's best-matching section can miss the asked-for fact while another
+/// section of the same short file holds it (pantheon#322). Parent-document retrieval: match on
+/// sections, answer from the file. Longer files keep the single section.
+pub const EXPAND_FILE_CHARS: usize = 6000;
+
 impl std::str::FromStr for Mode {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -118,6 +124,8 @@ pub struct SearchOptions {
     candidates: usize,
     /// At most this many hits per document; `None` for no cap.
     max_per_document: Option<usize>,
+    /// Append the rest of the top hit's file, in document order, when the file is short.
+    expand_file: bool,
 }
 
 impl SearchOptions {
@@ -130,6 +138,15 @@ impl SearchOptions {
             rerank,
             candidates: 40,
             max_per_document: Some(1),
+            expand_file: false,
+        }
+    }
+
+    /// Same options, with the top hit carrying the rest of its file when the file is short.
+    pub fn with_expand_file(self, expand_file: bool) -> Self {
+        Self {
+            expand_file,
+            ..self
         }
     }
 }
@@ -463,7 +480,32 @@ impl Index {
             hits = cap_per_key(hits, cap, |h| h.path.as_str());
         }
         hits.truncate(opts.k);
+        if opts.expand_file {
+            if let Some(top) = hits.first_mut() {
+                self.expand_file(top)?;
+            }
+        }
         Ok(hits)
+    }
+
+    /// Appends every other section of `top`'s file, in document order and each under its own
+    /// citation, when the whole file fits in `EXPAND_FILE_CHARS`. Otherwise `top` is unchanged.
+    fn expand_file(&self, top: &mut Hit) -> Result<()> {
+        let (count, chars) = store::file_size(&self.conn, &top.path)?;
+        if count < 2 || chars > EXPAND_FILE_CHARS {
+            return Ok(());
+        }
+        let sections = store::file_chunks(&self.conn, &top.path)?;
+        for (id, anchor, body) in sections {
+            if id != top.id {
+                top.text.push_str(&format!(
+                    "\n\n[also in this file: {}]\n{}",
+                    reference(&top.path, &anchor),
+                    body
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The full text of an indexed document, or `None` if `path` isn't one. The `.md` suffix
@@ -870,6 +912,53 @@ pub(crate) mod tests {
             .unwrap();
         let paths: HashSet<_> = capped.iter().map(|h| h.path.clone()).collect();
         assert_eq!(paths.len(), capped.len());
+    }
+
+    #[test]
+    fn expand_file_returns_the_rest_of_a_short_file_in_document_order() {
+        let f = Fixture::new();
+        let mut idx = f.open(true);
+        idx.build().unwrap();
+        let opts = SearchOptions::new(5, Mode::Hybrid, false);
+
+        // Off by default: one section per hit.
+        let plain = idx.search("qidi printer intro", &opts).unwrap();
+        assert!(!plain[0].text.contains("[also in this file:"));
+
+        let hits = idx
+            .search("qidi printer intro", &opts.clone().with_expand_file(true))
+            .unwrap();
+        let top = &hits[0];
+        assert!(top.path.ends_with("qidi.md"), "{top:?}");
+        // The matched intro alone has no port; the expanded file does, sections in order.
+        let net = top
+            .text
+            .find("Moonraker listens on port 7125")
+            .expect("network section");
+        let fw = top
+            .text
+            .find("Only USER VLAN 20")
+            .expect("firewall section");
+        assert!(net < fw, "{}", top.text);
+        assert!(!top
+            .text
+            .contains(&format!("[also in this file: {}]", top.reference)));
+        assert!(hits[1..]
+            .iter()
+            .all(|h| !h.text.contains("[also in this file:")));
+
+        // A file over the limit keeps its single section.
+        let big = format!(
+            "# Big\n\n## Alpha\n\nzebra marker\n\n## Beta\n\n{}\n",
+            "word ".repeat(EXPAND_FILE_CHARS / 4)
+        );
+        f.write("big.md", &big);
+        idx.build().unwrap();
+        let hits = idx
+            .search("zebra marker", &opts.with_expand_file(true))
+            .unwrap();
+        assert!(hits[0].path.ends_with("big.md"));
+        assert!(!hits[0].text.contains("[also in this file:"));
     }
 
     #[test]

@@ -115,6 +115,7 @@ struct SearchParams {
     k: Option<u64>,
     mode: Option<String>,
     rerank: Option<bool>,
+    expand: Option<String>,
 }
 
 async fn search(
@@ -128,6 +129,7 @@ async fn search(
             k: p.k,
             mode: p.mode,
             rerank: p.rerank,
+            expand: p.expand,
         })
         .await?;
     Ok(Json(json!({ "results": hits })))

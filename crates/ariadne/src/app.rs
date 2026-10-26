@@ -42,6 +42,9 @@ pub struct SearchRequest {
     pub k: Option<u64>,
     pub mode: Option<String>,
     pub rerank: Option<bool>,
+    /// `"file"` to return the rest of the top hit's file when it is short (parent-document
+    /// retrieval); omitted or `"none"` for single sections.
+    pub expand: Option<String>,
 }
 
 impl SearchRequest {
@@ -59,7 +62,17 @@ impl SearchRequest {
                 .parse::<Mode>()
                 .map_err(|e| AppError::BadRequest(e.to_string()))?,
         };
-        let opts = SearchOptions::new(k, mode, self.rerank.unwrap_or(DEFAULT_RERANK));
+        let expand_file = match self.expand.as_deref() {
+            None | Some("none") => false,
+            Some("file") => true,
+            Some(other) => {
+                return Err(AppError::BadRequest(format!(
+                    "unknown expand {other}; use file or none"
+                )))
+            }
+        };
+        let opts = SearchOptions::new(k, mode, self.rerank.unwrap_or(DEFAULT_RERANK))
+            .with_expand_file(expand_file);
         Ok((query, opts))
     }
 }
@@ -219,6 +232,10 @@ pub(crate) mod tests {
             },
             SearchRequest {
                 mode: Some("bogus".into()),
+                ..req("x")
+            },
+            SearchRequest {
+                expand: Some("bogus".into()),
                 ..req("x")
             },
         ] {
