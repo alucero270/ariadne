@@ -25,21 +25,6 @@ indent_size = 2
 [*.sh]
 indent_size = 2
 
-# C# / .NET
-[*.cs]
+# Rust: 4 spaces, per rustfmt
+[*.rs]
 indent_size = 4
-
-# Keep using directives clean and stable
-dotnet_sort_system_directives_first = true
-dotnet_separate_import_directive_groups = true
-
-# Prefer file-scoped namespaces for modern .NET (optional but consistent)
-csharp_style_namespace_declarations = file_scoped:suggestion
-
-# Prefer explicit access modifiers (reduces ambiguity)
-dotnet_style_require_accessibility_modifiers = for_non_interface_members:suggestion
-
-# Basic var preferences (keep readable; avoid forcing var everywhere)
-csharp_style_var_for_built_in_types = false:suggestion
-csharp_style_var_when_type_is_apparent = true:suggestion
-csharp_style_var_elsewhere = false:suggestion

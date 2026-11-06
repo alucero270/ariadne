@@ -1,6 +1,6 @@
-# Contributing to Strata
+# Contributing to Ariadne
 
-Strata follows strict commit conventions to keep history readable, reviewable,
+Ariadne follows strict commit conventions to keep history readable, reviewable,
 and issue-scoped.
 
 ---
@@ -53,7 +53,7 @@ ci:       CI/CD workflow changes
 
 Scope should describe the part of the system affected.
 
-Approved scopes for Strata:
+Approved scopes for Ariadne:
 
 api
 indexer
