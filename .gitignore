@@ -1,26 +1,12 @@
 /.idea
-/.vs
-.env
-/artifacts/
-**/bin/
-**/obj/
-**/node_modules/
-**/dist/
-*.user
-*.suo
-*.userprefs
-*.sln.ide
 .DS_Store
-# Frontend local install/build output
-src/Codex.Web/node_modules/
-src/Codex.Web/dist/
-src/Codex.Web/.next/
-src/Codex.Web/tsconfig.tsbuildinfo
-src/Codex.Web/.env.local
-src/Codex.Web/.env.*.local
-ops/.env
-# Ariadne (Rust) build output and local index files
+.env
+ops/ariadne/.env
+
+# Rust build output
 /target/
+
+# Local index files
 *.db
 *.db-journal
 *.db-wal

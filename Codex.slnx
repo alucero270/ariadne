@@ -1,8 +1,0 @@
-<Solution>
-  <Folder Name="/src/">
-    <Project Path="src/Codex.Api/Codex.Api.csproj" />
-    <Project Path="src/Codex.Contracts/Codex.Contracts.csproj" />
-    <Project Path="src/Codex.Embedder/Codex.Embedder.csproj" />
-    <Project Path="src/Codex.Indexer/Codex.Indexer.csproj" />
-  </Folder>
-</Solution>

@@ -73,3 +73,11 @@ documentation can't fix (the collisions above), and a coordinated rebuild that a
 - More than one source root or multiple concurrent writers become requirements.
 - Corpus size makes the in-memory vector scan too slow or too large.
 - MCP stops being the common way agents call tools.
+
+## Follow-up (2026-11-06)
+
+The GitHub repository and the `origin` remote are now `ariadne`. The .NET tree and its build,
+deployment, and documentation artifacts were removed in #157: Rust had passed the .NET slice
+(ingestion, full-text search, index jobs) and the decided deployment shape is one instance per
+corpus with agents calling MCP, with no web UI and no Postgres. The .NET code remains in git
+history. The "still say Strata" note above no longer applies.
