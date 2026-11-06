@@ -64,8 +64,20 @@ endpoint but `/health` requires the bearer token when one is set.
 - **expand=file**: when the top file is short, its other sections are appended, so a match on one
   section can answer from the whole file.
 
-Dense search loads every vector into memory and scans it. That is fine for tens of thousands of
-chunks; far larger corpora would need an approximate index.
+Dense search loads every vector into memory and scans it. Measured on a 32-core machine with the
+`scale` example at 1024 dimensions (the shape of `bge-m3`):
+
+| chunks | keyword build | keyword DB | +vectors DB | vectors | cold dense | bm25 p50 | dense p50 | hybrid p50 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1k | 0.05 s | 3 MB | 7 MB | 4 MB | 6 ms | 0.7 ms | 0.5 ms | 1.0 ms |
+| 10k | 0.6 s | 29 MB | 70 MB | 39 MB | 51 ms | 4.5 ms | 4.9 ms | 8.8 ms |
+| 100k | 7.2 s | 283 MB | 733 MB | 393 MB | 552 ms | 57 ms | 50 ms | 103 ms |
+
+The cost of dense search is memory: about `4 bytes × dimensions × chunks`, plus the index file. At
+1024 dimensions that is 393 MB resident for 100k chunks and 3.9 GB for 1M. Hybrid search stays
+under 110 ms at 100k chunks; past a million, an approximate index becomes necessary. The vector
+write took 13 s at 100k chunks with a synthetic embedder — with a real model the HTTP calls
+dominate, so measure one book before projecting a library.
 
 ## Correctness and limits
 
@@ -82,6 +94,12 @@ chunks; far larger corpora would need an approximate index.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+```
+
+To measure build time, index size, vector memory, and query latency on generated books:
+
+```bash
+cargo run --release --example scale -- --chunks 1000,10000,100000 --queries 50
 ```
 
 CI runs the same three commands on Linux. The tests that create symlinks are `#[cfg(unix)]`
