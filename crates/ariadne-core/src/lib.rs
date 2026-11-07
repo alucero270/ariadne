@@ -5,6 +5,7 @@
 
 mod chunk;
 mod eval;
+mod extract;
 mod index;
 mod ports;
 mod rank;
@@ -12,6 +13,7 @@ mod source;
 mod store;
 
 pub use eval::{EvalReport, EvalSet, ModeScore, Question};
+pub use extract::{enabled_formats, formats, Format};
 pub use index::{
     BuildStats, FileState, FileStatus, Hit, Index, IndexStats, Mode, SearchOptions, Source,
 };

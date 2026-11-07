@@ -4,10 +4,11 @@
 //! One writer and any number of readers may open the same database at once. Readers keep
 //! answering while a writer rebuilds, and pick up the new data once the rebuild commits.
 
-use crate::chunk::{chunk_markdown, reference, Chunk};
+use crate::chunk::{chunk_document, reference, Chunk};
+use crate::extract::{enabled_formats, extract, Format};
 use crate::ports::{normalize, Embedder, Models};
 use crate::rank::{cap_per_key, fts_query, fuse};
-use crate::source::{resolve_inside, walk_markdown, DEFAULT_EXCLUDES};
+use crate::source::{resolve_inside, walk_sources, DEFAULT_EXCLUDES};
 use crate::store;
 use anyhow::{bail, Result};
 use rusqlite::Connection;
@@ -19,23 +20,25 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// What to index: a root folder (read-only), the paths under it to skip, and the largest chunk
-/// in characters. See GLOSSARY.md.
+/// What to index: a root folder (read-only), the paths under it to skip, the formats to read,
+/// and the largest chunk in characters. See GLOSSARY.md.
 #[derive(Debug, Clone)]
 pub struct Source {
     root: PathBuf,
     excludes: Vec<String>,
     max_chars: usize,
+    formats: Vec<Format>,
 }
 
 impl Source {
     /// A source with the default excludes (VCS and editor folders, `node_modules`, scratch
-    /// artifacts) and chunks of at most 1200 characters.
+    /// artifacts), markdown as the only format, and chunks of at most 1200 characters.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
             max_chars: 1200,
+            formats: enabled_formats("md").expect("the markdown format is always enabled"),
         }
     }
 
@@ -45,6 +48,28 @@ impl Source {
             max_chars: max_chars.max(1),
             ..self
         }
+    }
+
+    /// The formats this source reads, replacing the default. An unknown format is an error that
+    /// lists the supported values, so the failure surfaces at startup, not mid-build.
+    pub fn with_formats(self, formats: Vec<Format>) -> Self {
+        Self { formats, ..self }
+    }
+
+    /// The formats this source reads.
+    pub fn formats(&self) -> &[Format] {
+        &self.formats
+    }
+
+    /// A stable signature of the enabled formats, stored in the build settings so changing the
+    /// list triggers a full rebuild: a file that was ignored before may now be indexable, and one
+    /// that was indexed before may now be ignored.
+    pub fn formats_signature(&self) -> String {
+        self.formats
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -157,6 +182,8 @@ pub struct BuildStats {
     pub files_changed: usize,
     pub files_removed: usize,
     pub files_skipped: usize,
+    /// Files with a disabled extension, by extension, from this build.
+    pub ignored: std::collections::BTreeMap<String, usize>,
     pub chunks_written: usize,
     pub seconds: f64,
 }
@@ -166,6 +193,10 @@ pub struct IndexStats {
     pub files: i64,
     pub chunks: i64,
     pub skipped: i64,
+    /// Files with a disabled extension, by extension, from the last build. Small: keyed by the
+    /// extension, not by file, so the count stays small no matter how many files match.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub ignored: std::collections::BTreeMap<String, usize>,
     pub embedder: Option<String>,
     pub reranker: Option<String>,
     pub indexed_at: Option<String>,
@@ -265,16 +296,25 @@ impl Index {
     }
 
     /// Bring the index up to date with the source. Unchanged files are skipped; a different
-    /// embedder, contextualizer, chunk size, or root rebuilds everything.
+    /// embedder, contextualizer, chunk size, root, or format list rebuilds everything.
     pub fn build(&mut self) -> Result<BuildStats> {
         let start = Instant::now();
         let root = self.source.root.canonicalize()?;
-        let files = walk_markdown(&root, &self.source.excludes)?;
+        // Walk the source for every enabled format. Files with a disabled extension are not
+        // indexed but are counted by extension, so the count stays small.
+        let mut ignored: std::collections::BTreeMap<String, usize> = Default::default();
+        let files = walk_sources(
+            &root,
+            &self.source.excludes,
+            self.source.formats(),
+            &mut ignored,
+        )?;
         let settings = [
             ("embedder", self.embedder_name()),
             ("contextualizer", self.contextualizer_name()),
             ("max_chars", self.source.max_chars.to_string()),
             ("root", root.to_string_lossy().into_owned()),
+            ("formats", self.source.formats_signature()),
         ];
         let mut full = false;
         for (key, value) in &settings {
@@ -290,7 +330,7 @@ impl Index {
         };
 
         // Read and chunk changed documents. No write lock is held until the last step. A file
-        // that cannot be read or chunked is recorded as skipped with a warning, and the build
+        // that cannot be read or extracted is recorded as skipped with a warning, and the build
         // moves on. Only store and transaction errors fail the build.
         let mut changed = Vec::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
@@ -309,8 +349,19 @@ impl Index {
             if known.get(&file.rel) == Some(&sha) {
                 continue;
             }
+            // Dispatch to the extractor for this file's format, then chunk the document. An
+            // extraction error (the format's bytes are not what the extractor expects) becomes a
+            // skip, like a read error, not a build failure.
+            let document = match extract(&file.rel, &raw, self.source.formats()) {
+                Ok(document) => document,
+                Err(e) => {
+                    eprintln!("warning: skipping {}: {e}", file.rel);
+                    skipped.push((file.rel.clone(), e.to_string()));
+                    continue;
+                }
+            };
+            let chunks = chunk_document(&file.rel, &document, self.source.max_chars);
             let text = String::from_utf8_lossy(&raw).into_owned();
-            let chunks = chunk_markdown(&file.rel, &text, self.source.max_chars);
             changed.push(ChangedDocument {
                 path: file.rel.clone(),
                 sha,
@@ -319,6 +370,7 @@ impl Index {
             });
         }
         stats.files_skipped = skipped.len();
+        stats.ignored = ignored;
 
         self.add_contexts(&mut changed)?;
         let vectors = self.embed_documents(&changed, full)?;
@@ -343,6 +395,7 @@ impl Index {
             stats.files_removed += 1;
         }
         store::replace_skipped(&tx, &skipped)?;
+        store::set_meta(&tx, "ignored", &serde_json::to_string(&stats.ignored)?)?;
         for (key, value) in &settings {
             store::set_meta(&tx, key, value)?;
         }
@@ -483,10 +536,16 @@ impl Index {
 
     pub fn stats(&self) -> Result<IndexStats> {
         let (files, chunks, skipped) = store::counts(&self.conn)?;
+        let ignored: std::collections::BTreeMap<String, usize> =
+            match store::meta(&self.conn, "ignored")? {
+                Some(value) => serde_json::from_str(&value)?,
+                None => std::collections::BTreeMap::new(),
+            };
         Ok(IndexStats {
             files,
             chunks,
             skipped,
+            ignored,
             embedder: store::meta(&self.conn, "embedder")?,
             reranker: self.models.reranker.as_ref().map(|r| r.name()),
             indexed_at: store::meta(&self.conn, "indexed_at")?,
@@ -1351,5 +1410,112 @@ pub(crate) mod tests {
             .search("sourdough starter", &opts(Mode::Dense, 1))
             .unwrap();
         assert_eq!(hits[0].path, "bread.md");
+    }
+
+    // The default config indexes markdown through the new extractor dispatch exactly as before:
+    // the standard fixture still yields its expected chunks, so a default index is unchanged.
+    use crate::chunk::{chunk_document, markdown_document, Document};
+
+    #[test]
+    fn default_config_indexes_markdown_through_the_dispatch() {
+        for (path, text, chunks) in [("qidi.md", PRINTER, 3), ("voice.md", VOICE, 1)] {
+            let document = markdown_document(path, text);
+            assert_eq!(
+                chunk_document(path, &document, 1200).len(),
+                chunks,
+                "{path}"
+            );
+        }
+        let f = Fixture::new();
+        let mut idx = f.open(false);
+        idx.build().unwrap();
+        let files = idx.files().unwrap();
+        let qidi = files
+            .iter()
+            .find(|x| x.path == "systems/fabrication/qidi.md")
+            .unwrap();
+        assert_eq!(qidi.chunks, 3);
+        let voice = files.iter().find(|x| x.path == "voice.md").unwrap();
+        assert_eq!(voice.chunks, 1);
+    }
+
+    /// A test-only extractor: indexes everything, except a file whose first line starts with
+    /// `BOMB`, which fails (to prove an extractor error becomes a skip).
+    fn fake_extract(_path: &str, bytes: &[u8]) -> Result<Document> {
+        let text = String::from_utf8_lossy(bytes);
+        if text.lines().next().unwrap_or_default().starts_with("BOMB") {
+            return Err(anyhow::anyhow!("cannot extract"));
+        }
+        Ok(Document {
+            title: "fake".into(),
+            sections: vec![crate::chunk::Section {
+                headings: vec!["fake".into()],
+                body: text.into_owned(),
+            }],
+        })
+    }
+
+    #[test]
+    fn formats_dispatch_rebuild_on_change_and_skip_on_error() {
+        let f = Fixture::new(); // systems/fabrication/qidi.md, voice.md
+        f.write("thing.fke", "a fake thing\n");
+        f.write("bomb.fke", "BOMB should not index\n");
+        let db = f.db.path().join("i.db");
+
+        let md = || Format {
+            id: "md",
+            extensions: &["md"],
+            extract: crate::extract::markdown,
+        };
+        let with_fake = vec![
+            md(),
+            Format {
+                id: "fke",
+                extensions: &["fke"],
+                extract: fake_extract,
+            },
+        ];
+
+        // Build 1: markdown plus the fake format.
+        let mut idx = Index::open(
+            &db,
+            Source::new(f.src.path()).with_formats(with_fake.clone()),
+            Models::default(),
+        )
+        .unwrap();
+        let stats = idx.build().unwrap();
+        let files = idx.files().unwrap();
+        // Dispatch: the .fke file went to the fake extractor and is indexed...
+        assert!(files
+            .iter()
+            .any(|x| x.path == "thing.fke" && x.status == FileState::Indexed));
+        // ...and an extractor error is a skip, not a build failure.
+        let bomb = files.iter().find(|x| x.path == "bomb.fke").unwrap();
+        assert_eq!(bomb.status, FileState::Skipped);
+        assert!(stats.files_skipped >= 1);
+
+        // A format change forces a full rebuild that re-evaluates what is indexed: dropping the
+        // fake format ignores both .fke files.
+        let mut md_only = Index::open(
+            &db,
+            Source::new(f.src.path()).with_formats(vec![md()]),
+            Models::default(),
+        )
+        .unwrap();
+        md_only.build().unwrap();
+        let files = md_only.files().unwrap();
+        assert!(
+            !files.iter().any(|x| x.path == "thing.fke"),
+            "ignored after the format change: {files:?}"
+        );
+        assert_eq!(md_only.stats().unwrap().ignored.get("fke"), Some(&2));
+    }
+
+    #[test]
+    fn a_unknown_format_is_a_startup_error_that_lists_the_supported_values() {
+        assert!(enabled_formats("md").is_ok());
+        let err = enabled_formats("pdf").unwrap_err().to_string();
+        assert!(err.contains("unknown format pdf"), "{err}");
+        assert!(err.contains("md"), "supported values listed: {err}");
     }
 }
