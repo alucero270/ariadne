@@ -76,6 +76,15 @@ chunks; far larger corpora would need an approximate index.
 - One writer and any number of readers may share a database; readers keep answering while a
   rebuild runs.
 
+## When a model endpoint fails
+
+A build reads, chunks, writes contexts, and embeds before it opens the write transaction, so a
+failed embedder or contextualizer commits nothing. The previous index keeps serving, and
+`POST /reindex` returns the error.
+
+Contexts are cached as they arrive, so the next build reuses every context that finished and only
+asks the model for the rest. A failed build never costs you the index or the work already paid for.
+
 ## Development
 
 ```bash

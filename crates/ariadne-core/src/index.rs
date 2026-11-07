@@ -1015,6 +1015,71 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("embedding size changed"), "{err}");
     }
 
+    /// Succeeds until `fail_after` calls, then fails like a dead endpoint. The name matches
+    /// `HashEmbedder`, so a rebuild stays incremental and nothing is rebuilt for free.
+    struct FailingEmbedder {
+        calls: AtomicUsize,
+        fail_after: usize,
+    }
+
+    impl Embedder for FailingEmbedder {
+        fn name(&self) -> String {
+            "hash:64".into()
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) >= self.fail_after {
+                bail!("embedding endpoint unavailable");
+            }
+            HashEmbedder.embed(texts)
+        }
+    }
+
+    #[test]
+    fn a_failed_embedder_keeps_the_previous_index() {
+        let f = Fixture::new();
+        f.open(true).build().unwrap();
+
+        f.write(
+            "bread.md",
+            "# Bread\n\n## Sourdough\n\nFeed the starter daily.\n",
+        );
+        let mut failing = f.open_with(Models {
+            embedder: Some(Box::new(FailingEmbedder {
+                calls: AtomicUsize::new(0),
+                fail_after: 0,
+            })),
+            reranker: None,
+            contextualizer: None,
+        });
+        let err = failing.build().unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+
+        assert_eq!(
+            failing.stats().unwrap().files,
+            2,
+            "the previous index is intact"
+        );
+        assert!(
+            failing
+                .search("sourdough", &opts(Mode::Bm25, 5))
+                .unwrap()
+                .is_empty(),
+            "the failed rebuild wrote nothing"
+        );
+        assert_eq!(
+            failing.search("moonraker", &opts(Mode::Bm25, 1)).unwrap()[0].path,
+            "systems/fabrication/qidi.md"
+        );
+
+        // The failure leaves no trace that blocks the next attempt.
+        let mut good = f.open(true);
+        assert_eq!(good.build().unwrap().files_changed, 1);
+        assert!(!good
+            .search("sourdough", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .is_empty());
+    }
+
     /// Breaks the port contract both ways: unnormalized vectors, and one vector too few.
     struct SloppyEmbedder {
         short: bool,
@@ -1172,19 +1237,45 @@ pub(crate) mod tests {
     #[test]
     fn a_failed_description_keeps_the_index_and_finished_work() {
         let f = Fixture::new();
-        let (mut fake, _) = FakeContextualizer::new("ctx-a");
-        fake.fail_on = Some("Firewall");
+        // Build once so there is an index that a failed rebuild must not damage.
+        f.open_with(with_contexts(FakeContextualizer::new("ctx-a").0, false))
+            .build()
+            .unwrap();
+
+        // Only the new section needs a description, and that call fails.
+        f.write(
+            "bread.md",
+            "# Bread\n\n## Sourdough\n\nFeed the starter daily.\n",
+        );
+        let (mut fake, calls) = FakeContextualizer::new("ctx-a");
+        fake.fail_on = Some("Sourdough");
         let mut idx = f.open_with(with_contexts(fake, false));
         let err = idx.build().unwrap_err();
         assert!(format!("{err:#}").contains("model unavailable"), "{err:#}");
-        assert_eq!(idx.stats().unwrap().files, 0, "nothing written");
-
-        let (fake, calls) = FakeContextualizer::new("ctx-a");
-        f.open_with(with_contexts(fake, false)).build().unwrap();
-        assert!(
-            calls.load(Ordering::SeqCst) < 4,
-            "contexts finished before the failure were cached"
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cached contexts are not requested again"
         );
+        assert_eq!(
+            idx.stats().unwrap().files,
+            2,
+            "the previous index is intact"
+        );
+        assert!(idx
+            .search("sourdough", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .is_empty());
+
+        // Nothing finished is lost: the retry only describes the section that failed.
+        let (fake, calls) = FakeContextualizer::new("ctx-a");
+        let mut idx = f.open_with(with_contexts(fake, false));
+        assert_eq!(idx.build().unwrap().files_changed, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!idx
+            .search("sourdough", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
