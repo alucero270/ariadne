@@ -2,12 +2,18 @@
 //! the defaults and limits, validates once, and types errors by who is at fault. Front ends
 //! only choose how to present results.
 
-use ariadne_core::{BuildStats, EvalReport, EvalSet, Hit, Index, IndexStats, Mode, SearchOptions};
+use ariadne_core::{
+    BuildStats, EvalReport, EvalSet, FileState, FileStatus, Hit, Index, IndexStats, Mode,
+    SearchOptions,
+};
+use serde::Serialize;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_K: u64 = 5;
 pub const MAX_K: u64 = 20;
+pub const DEFAULT_FILE_LIMIT: u64 = 200;
+pub const MAX_FILE_LIMIT: u64 = 1000;
 pub const MAX_QUERY_CHARS: usize = 500;
 pub const MAX_PATH_CHARS: usize = 400;
 /// Served searches skip the reranker unless the caller asks: on a CPU reranker it costs seconds
@@ -77,6 +83,29 @@ impl SearchRequest {
     }
 }
 
+/// Parse a `status` filter value (`indexed` / `skipped`) into a [`FileState`].
+pub fn parse_file_status(s: &str) -> Result<FileState, AppError> {
+    match s {
+        "indexed" => Ok(FileState::Indexed),
+        "skipped" => Ok(FileState::Skipped),
+        other => Err(AppError::BadRequest(format!(
+            "unknown status {other}; use indexed or skipped"
+        ))),
+    }
+}
+
+/// `limit` for the file listings: default 200, at least 1, values above [`MAX_FILE_LIMIT`]
+/// are clamped rather than refused.
+fn validate_file_limit(limit: Option<u64>) -> Result<u64, AppError> {
+    let limit = limit.unwrap_or(DEFAULT_FILE_LIMIT);
+    if limit == 0 {
+        return Err(AppError::BadRequest(format!(
+            "limit must be from 1 to {MAX_FILE_LIMIT}"
+        )));
+    }
+    Ok(limit.min(MAX_FILE_LIMIT))
+}
+
 fn validate_k(k: Option<u64>) -> Result<usize, AppError> {
     let k = k.unwrap_or(DEFAULT_K);
     if !(1..=MAX_K).contains(&k) {
@@ -125,6 +154,47 @@ impl App {
         .await
     }
 
+    /// Every file the index knows about (indexed and skipped), filtered by status and path
+    /// prefix, sorted by path, then paginated: `total` counts the filtered list before
+    /// pagination, `files` is the `[offset .. offset + limit]` slice of it. Shared by the
+    /// HTTP `/files` route and the MCP `list_documents` tool.
+    pub async fn files(
+        self: &Arc<Self>,
+        status: Option<FileState>,
+        prefix: Option<String>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> Result<FileList, AppError> {
+        let limit = validate_file_limit(limit)?;
+        let offset = offset.unwrap_or(0);
+        self.with_reader(move |idx| {
+            let filtered: Vec<FileStatus> = idx
+                .files()
+                .map_err(AppError::Internal)?
+                .into_iter()
+                .filter(|f| {
+                    let status_ok = match status {
+                        None => true,
+                        Some(s) => f.status == s,
+                    };
+                    let prefix_ok = match prefix.as_deref() {
+                        None => true,
+                        Some(p) => f.path.starts_with(p),
+                    };
+                    status_ok && prefix_ok
+                })
+                .collect();
+            let total = filtered.len() as u64;
+            let files = filtered
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect();
+            Ok(FileList { total, files })
+        })
+        .await
+    }
+
     /// Measure retrieval in every mode, plus hybrid with the reranker when one is configured.
     pub async fn evaluate(
         self: &Arc<Self>,
@@ -157,6 +227,14 @@ impl App {
         })
         .await
     }
+}
+
+/// One page of the file listing, as the HTTP `/files` route answers it.
+#[derive(Debug, Serialize)]
+pub struct FileList {
+    /// Files matching the status and prefix filters, before pagination.
+    pub total: u64,
+    pub files: Vec<FileStatus>,
 }
 
 fn poisoned<T>(_: T) -> AppError {
@@ -214,6 +292,134 @@ pub(crate) mod tests {
             query: query.into(),
             ..Default::default()
         }
+    }
+
+    /// Like `fixture`, plus an unreadable `.md` the last build recorded as skipped, and a
+    /// second directory so prefix filters have something to bite on.
+    #[cfg(unix)]
+    pub fn fixture_with_skipped() -> Fixture {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("systems/fabrication")).unwrap();
+        fs::write(
+            src.path().join("systems/fabrication/qidi.md"),
+            "# Qidi Plus 4\n\n## Network Placement\n\nMoonraker listens on port 7125.\n",
+        )
+        .unwrap();
+        fs::write(
+            src.path().join("systems/locked.md"),
+            "# Locked\n\nVault passphrase.\n",
+        )
+        .unwrap();
+        fs::create_dir_all(src.path().join("tools")).unwrap();
+        fs::write(
+            src.path().join("tools/bench.md"),
+            "# Bench\n\n## Router\n\nClamp the panel.\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            src.path().join("systems/locked.md"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let open = || {
+            Index::open(
+                &db.path().join("i.db"),
+                Source::new(src.path()),
+                Models::default(),
+            )
+            .unwrap()
+        };
+        let mut writer = open();
+        writer.build().unwrap();
+        let app = App::new(open(), writer);
+        Fixture { src, _db: db, app }
+    }
+
+    #[tokio::test]
+    async fn file_limits_are_validated_and_clamped() {
+        assert_eq!(validate_file_limit(None).unwrap(), DEFAULT_FILE_LIMIT);
+        assert_eq!(
+            validate_file_limit(Some(MAX_FILE_LIMIT + 1)).unwrap(),
+            MAX_FILE_LIMIT
+        );
+        assert_eq!(validate_file_limit(Some(1)).unwrap(), 1);
+        assert!(matches!(
+            validate_file_limit(Some(0)),
+            Err(AppError::BadRequest(_))
+        ));
+        assert_eq!(parse_file_status("indexed").unwrap(), FileState::Indexed);
+        assert_eq!(parse_file_status("skipped").unwrap(), FileState::Skipped);
+        for bad in ["bogus", "", "Indexed"] {
+            assert!(matches!(
+                parse_file_status(bad),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+        let f = fixture();
+        assert!(matches!(
+            f.app.files(None, None, Some(0), None).await,
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn files_lists_indexed_and_skipped_with_filters() {
+        let f = fixture_with_skipped();
+        let all = f.app.files(None, None, None, None).await.unwrap();
+        assert_eq!(all.total, 3);
+        let paths: Vec<_> = all.files.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "systems/fabrication/qidi.md",
+                "systems/locked.md",
+                "tools/bench.md"
+            ]
+        );
+        assert_eq!(all.files[0].status, FileState::Indexed);
+        assert!(all.files[0].chunks > 0 && all.files[0].reason.is_none());
+        assert_eq!(all.files[1].status, FileState::Skipped);
+        assert!(all.files[1].reason.is_some());
+
+        let skipped = f
+            .app
+            .files(Some(FileState::Skipped), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(skipped.total, 1);
+        assert_eq!(skipped.files[0].path, "systems/locked.md");
+        let indexed = f
+            .app
+            .files(Some(FileState::Indexed), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(indexed.total, 2);
+
+        let under = f
+            .app
+            .files(None, Some("systems/".into()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(under.total, 2);
+        let none = f
+            .app
+            .files(Some(FileState::Skipped), Some("tools/".into()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(none.total, 0);
+        assert!(none.files.is_empty());
+
+        // Pagination slices the filtered, sorted list; total is the pre-pagination count.
+        let page = f.app.files(None, None, Some(2), Some(1)).await.unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.files.len(), 2);
+        assert_eq!(page.files[0].path, "systems/locked.md");
+        let past_end = f.app.files(None, None, Some(2), Some(3)).await.unwrap();
+        assert_eq!(past_end.total, 3);
+        assert!(past_end.files.is_empty());
     }
 
     #[tokio::test]
