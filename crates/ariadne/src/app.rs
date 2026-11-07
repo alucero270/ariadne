@@ -287,6 +287,34 @@ pub(crate) mod tests {
         Fixture { src, _db: db, app }
     }
 
+    /// Like `fixture`, with a made-up EPUB beside the markdown and the `md,epub` formats
+    /// enabled, so the front ends can be tested against a non-Markdown document (#154).
+    pub fn fixture_with_epub() -> Fixture {
+        let src = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("systems/fabrication")).unwrap();
+        fs::write(
+            src.path().join("systems/fabrication/qidi.md"),
+            "# Qidi Plus 4\n\n## Network Placement\n\nMoonraker listens on port 7125.\n",
+        )
+        .unwrap();
+        ariadne_core::epub::fixtures::write_epub(
+            src.path(),
+            "Library/Some Book.epub",
+            &ariadne_core::epub::fixtures::epub3_nav(),
+        );
+        let db = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::new(crate::config::Settings {
+            root: Some(src.path().to_path_buf()),
+            db: db.path().join("i.db"),
+            formats: Some("md,epub".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let (app, stats) = config.open_app().unwrap();
+        assert_eq!(stats.files_changed, 2, "the markdown and the book");
+        Fixture { src, _db: db, app }
+    }
+
     fn req(query: &str) -> SearchRequest {
         SearchRequest {
             query: query.into(),
@@ -498,6 +526,56 @@ pub(crate) mod tests {
                 Err(AppError::NotFound(_))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn an_epub_reads_as_rendered_text_and_not_as_bytes() {
+        let f = fixture_with_epub();
+        let text = f
+            .app
+            .read_document("Library/Some Book.epub".into())
+            .await
+            .unwrap();
+        assert!(text.starts_with("# Replication Basics"), "{text}");
+        assert!(text.contains("## Chapter 5 Replication"), "{text}");
+        assert!(text.contains("Print a calibration cube first."), "{text}");
+        assert!(!text.bytes().any(|b| b == 0), "container bytes: {text:?}");
+
+        // Markdown is still its source, and an extension-less epub path is not a document.
+        assert!(f
+            .app
+            .read_document("systems/fabrication/qidi".into())
+            .await
+            .unwrap()
+            .starts_with("# Qidi Plus 4"));
+        for path in ["Library/Some Book", "../etc/passwd", "missing"] {
+            assert!(
+                matches!(
+                    f.app.read_document(path.into()).await,
+                    Err(AppError::NotFound(_))
+                ),
+                "{path}"
+            );
+        }
+
+        // `expand=file` works on an epub hit: the top section carries the rest of the book.
+        let hits = f
+            .app
+            .search(SearchRequest {
+                query: "calibration cube".into(),
+                expand: Some("file".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits[0].path, "Library/Some Book.epub");
+        assert!(
+            hits[0]
+                .text
+                .contains("[also in this file: Library/Some Book.epub#Chapter 1 Setup]"),
+            "{}",
+            hits[0].text
+        );
     }
 
     #[tokio::test]

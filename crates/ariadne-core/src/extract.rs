@@ -49,6 +49,62 @@ pub fn formats() -> Vec<Format> {
     ]
 }
 
+/// Render a [`Document`] back into Markdown: `# Title`, then each section in reading order,
+/// under only the trail headings that are new since the previous section, then its trimmed
+/// body. `read_document` uses this so a read of a non-Markdown file returns the book's text
+/// rather than the container's bytes.
+pub(crate) fn document_markdown(document: &Document) -> String {
+    let mut blocks = Vec::new();
+    if !document.title.trim().is_empty() {
+        blocks.push(format!("# {}", document.title));
+    }
+    let mut trail: Vec<String> = Vec::new();
+    for section in &document.sections {
+        let shared = trail
+            .iter()
+            .zip(section.headings.iter())
+            .take_while(|(was, now)| was == now)
+            .count();
+        // A heading's depth in the trail sets its level: depth 1 is `##`, depth 2 is `###`.
+        for (depth, heading) in section.headings.iter().enumerate().skip(shared) {
+            blocks.push(format!("{} {heading}", "#".repeat((depth + 2).min(6))));
+        }
+        // An empty section adds no text, but its headings still move the trail, so the next
+        // section nests under them rather than repeating them.
+        trail = section.headings.clone();
+        let body = section.body.trim();
+        if !body.is_empty() {
+            blocks.push(body.to_string());
+        }
+    }
+    let text = collapse_blank_lines(&blocks.join("\n\n"));
+    match text.is_empty() {
+        true => String::new(),
+        false => format!("{text}\n"),
+    }
+}
+
+/// Collapse runs of three or more newlines to a single blank line.
+fn collapse_blank_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut newlines = 0usize;
+    for c in text.chars() {
+        if c == '\n' {
+            newlines += 1;
+            continue;
+        }
+        if newlines > 0 {
+            out.push_str(&"\n".repeat(newlines.min(2)));
+            newlines = 0;
+        }
+        out.push(c);
+    }
+    if newlines > 0 {
+        out.push_str(&"\n".repeat(newlines.min(2)));
+    }
+    out
+}
+
 /// The format covering a path's extension, if any enabled format covers it.
 pub(crate) fn covering_format(formats: &[Format], path: &str) -> Option<Format> {
     let ext = Path::new(path)
@@ -165,6 +221,75 @@ mod tests {
             err.contains("md"),
             "supported values should be listed: {err}"
         );
+    }
+
+    fn doc(title: &str, sections: &[(&[&str], &str)]) -> Document {
+        Document {
+            title: title.to_string(),
+            sections: sections
+                .iter()
+                .map(|(headings, body)| Section {
+                    headings: headings.iter().map(|h| (*h).to_string()).collect(),
+                    body: (*body).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn document_markdown_renders_the_title_then_trails_and_bodies_in_order() {
+        let text = document_markdown(&doc(
+            "Replication Basics",
+            &[
+                (
+                    &["Chapter 5 Replication"],
+                    "\n Print a calibration cube first. \n",
+                ),
+                (
+                    &["Chapter 5 Replication", "Belt tension"],
+                    "Tight but not too tight.",
+                ),
+                (&["Chapter 1 Setup"], "Plug in the press."),
+                (&["Chapter 1 Setup", "Power"], "   "),
+            ],
+        ));
+        assert_eq!(
+            text,
+            "# Replication Basics\n\n## Chapter 5 Replication\n\nPrint a calibration cube first.\n\n### Belt tension\n\nTight but not too tight.\n\n## Chapter 1 Setup\n\nPlug in the press.\n\n### Power\n"
+        );
+    }
+
+    #[test]
+    fn document_markdown_emits_a_repeated_heading_once_and_keeps_the_trail() {
+        let text = document_markdown(&doc(
+            "Notes",
+            &[
+                (&["Fabrication", "Belt tension"], "one"),
+                (&["Fabrication", "Belt tension"], "two"),
+                // The empty section contributes no text but updates the trail, so `Tension`
+                // nests under `Bed leveling` instead of being re-labelled.
+                (&["Fabrication", "Bed leveling"], "   "),
+                (&["Fabrication", "Bed leveling", "Tension"], "three"),
+            ],
+        ));
+        assert_eq!(
+            text,
+            "# Notes\n\n## Fabrication\n\n### Belt tension\n\none\n\ntwo\n\n### Bed leveling\n\n#### Tension\n\nthree\n"
+        );
+        assert_eq!(text.matches("## Fabrication").count(), 1);
+    }
+
+    #[test]
+    fn document_markdown_of_an_empty_document_is_empty() {
+        assert_eq!(document_markdown(&doc("", &[(&[], "   ")])), "");
+    }
+
+    #[test]
+    fn deep_trails_stop_at_six_hashes() {
+        let deep: Vec<&str> = (0..8).map(|_| "h").collect();
+        let text = document_markdown(&doc("T", &[(&deep, "body")]));
+        assert!(text.contains("###### h"), "{text}");
+        assert!(!text.contains("#######"), "{text}");
     }
 
     #[test]
