@@ -5,7 +5,7 @@
 //! answering while a writer rebuilds, and pick up the new data once the rebuild commits.
 
 use crate::chunk::{chunk_document, reference, Chunk};
-use crate::extract::{covering_format, enabled_formats, extract, Format};
+use crate::extract::{covering_format, document_markdown, enabled_formats, extract, Format};
 use crate::ports::{normalize, Embedder, Models};
 use crate::rank::{cap_per_key, fts_query, fuse};
 use crate::source::{resolve_inside, walk_sources, DEFAULT_EXCLUDES};
@@ -638,22 +638,41 @@ impl Index {
         Ok(())
     }
 
-    /// The full text of an indexed document, or `None` if `path` isn't one. The `.md` suffix
-    /// is optional. Nothing outside the index or the source root is ever read.
+    /// The full text of an indexed document as Markdown, or `None` if `path` isn't one. A
+    /// Markdown file returns its source; any other indexed format is extracted again and
+    /// rendered, so a read of a book yields its headings and text, not its container bytes.
+    /// Nothing outside the index or the source root is ever read.
     pub fn read_document(&self, path: &str) -> Result<Option<String>> {
         let path = path.trim_start_matches('/');
-        let path = if path.ends_with(".md") {
-            path.to_string()
+        // Exact indexed path wins; `.md` is inferred only for an extension-less path whose
+        // `.md` sibling is indexed (a cited path already carries its own extension).
+        let exact = store::is_indexed(&self.conn, path)?;
+        let inferred = if exact {
+            None
+        } else if std::path::Path::new(path).extension().is_none() {
+            let with_md = format!("{path}.md");
+            store::is_indexed(&self.conn, &with_md)?.then_some(with_md)
         } else {
-            format!("{path}.md")
+            None
         };
-        if !store::is_indexed(&self.conn, &path)? {
+        let Some(path) = exact.then(|| path.to_string()).or(inferred) else {
             return Ok(None);
+        };
+        let file = match resolve_inside(&self.source.root, &path) {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        if path.ends_with(".md") {
+            return Ok(Some(std::fs::read_to_string(file)?));
         }
-        match resolve_inside(&self.source.root, &path) {
-            Ok(file) => Ok(Some(std::fs::read_to_string(file)?)),
-            Err(_) => Ok(None),
-        }
+        // Not markdown: re-run the file's extractor and render the document as Markdown, so a
+        // reader gets the book's text instead of the container bytes.
+        let Some(format) = covering_format(self.source.formats(), &path) else {
+            return Ok(None);
+        };
+        let bytes = std::fs::read(&file)?;
+        let document = (format.extract)(&path, &bytes)?;
+        Ok(Some(document_markdown(&document)))
     }
 
     /// Ranked chunk ids from each retriever the mode uses; empty rankings are dropped.
@@ -1191,6 +1210,11 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap()
             .contains("Moonraker"));
+        // The explicit `.md` form returns the same raw source, byte for byte.
+        assert_eq!(
+            idx.read_document("systems/fabrication/qidi.md").unwrap(),
+            idx.read_document("systems/fabrication/qidi").unwrap()
+        );
         assert!(idx
             .read_document("/voice.md")
             .unwrap()
@@ -1631,6 +1655,128 @@ pub(crate) mod tests {
         assert!(reason.contains("over the 200 MB limit"), "{reason}");
         // The rest of the source still indexes.
         assert_eq!(stats.files_changed, 2);
+    }
+
+    /// An index over `md` plus `epub` with the made-up book beside the markdown fixtures.
+    fn epub_index(f: &Fixture) -> Index {
+        Index::open(
+            &f.db.path().join("i.db"),
+            Source::new(f.src.path()).with_formats(vec![md_format(), epub_format()]),
+            Models::default(),
+        )
+        .unwrap()
+    }
+
+    // #154: reading a non-Markdown document returns its text, not the container's bytes.
+    #[test]
+    fn read_document_renders_an_epub_instead_of_returning_its_bytes() {
+        let f = Fixture::new();
+        crate::epub::fixtures::write_epub(
+            f.src.path(),
+            "Library/Some Book.epub",
+            &crate::epub::fixtures::epub3_nav(),
+        );
+        let mut idx = epub_index(&f);
+        idx.build().unwrap();
+
+        // The path exactly as search cites it: extension kept, no `#heading`.
+        let text = idx
+            .read_document("Library/Some Book.epub")
+            .unwrap()
+            .expect("the book is indexed");
+        assert!(text.starts_with("# Replication Basics"), "{text}");
+        assert!(text.contains("## Chapter 5 Replication"), "{text}");
+        assert!(text.contains("Print a calibration cube first."), "{text}");
+        assert!(text.contains("### Belt tension"), "{text}");
+        assert!(text.contains("## Chapter 1 Setup"), "{text}");
+        assert!(
+            text.contains("Plug in the press & level the bed."),
+            "{text}"
+        );
+        // Spine order, not archive order.
+        assert!(
+            text.find("Chapter 5 Replication") < text.find("Chapter 1 Setup"),
+            "{text}"
+        );
+        // No zip bytes: readable text all the way through.
+        assert!(!text.contains("PK\u{3}\u{4}"), "{text}");
+        assert!(!text.bytes().any(|b| b == 0), "{text:?}");
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+
+        // The extension-less form stays a markdown convenience: a cited epub needs its
+        // extension, and so does any path that is not indexed.
+        for other in [
+            "Library/Some Book",
+            "Library/Other Book.epub",
+            "../outside",
+            "../etc/passwd",
+            "notes.txt",
+        ] {
+            assert!(idx.read_document(other).unwrap().is_none(), "{other}");
+        }
+        // Markdown through the same code path is still its raw source.
+        assert!(idx
+            .read_document("systems/fabrication/qidi")
+            .unwrap()
+            .unwrap()
+            .starts_with("# Qidi Plus 4"));
+    }
+
+    #[test]
+    fn read_document_of_an_epub_not_indexed_by_the_enabled_formats_is_none() {
+        let f = Fixture::new();
+        crate::epub::fixtures::write_epub(
+            f.src.path(),
+            "Library/Some Book.epub",
+            &crate::epub::fixtures::epub3_nav(),
+        );
+        let mut idx = f.open(false); // markdown only: the book is ignored, not indexed
+        idx.build().unwrap();
+        assert!(idx
+            .read_document("Library/Some Book.epub")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn expand_file_appends_the_rest_of_an_epub_to_its_top_hit() {
+        let f = Fixture::new();
+        crate::epub::fixtures::write_epub(
+            f.src.path(),
+            "Library/Some Book.epub",
+            &crate::epub::fixtures::epub3_nav(),
+        );
+        let mut idx = epub_index(&f);
+        idx.build().unwrap();
+
+        let hits = idx
+            .search(
+                "calibration cube",
+                &opts(Mode::Bm25, 3).with_expand_file(true),
+            )
+            .unwrap();
+        let top = &hits[0];
+        assert_eq!(top.path, "Library/Some Book.epub", "{top:?}");
+        assert!(
+            top.text.contains("Print a calibration cube first."),
+            "{}",
+            top.text
+        );
+        // The rest of the book follows, each part under its own citation.
+        assert!(
+            top.text
+                .contains("[also in this file: Library/Some Book.epub#Chapter 1 Setup]"),
+            "{}",
+            top.text
+        );
+        assert!(top.text.contains("level the bed"), "{}", top.text);
+        // The section that matched is not repeated among the appended ones.
+        assert!(
+            !top.text
+                .contains(&format!("[also in this file: {}]", top.reference)),
+            "{}",
+            top.text
+        );
     }
 
     #[test]

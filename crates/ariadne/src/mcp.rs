@@ -91,7 +91,7 @@ fn tools() -> Value {
         },
         {
             "name": "read_document",
-            "description": "Read one indexed document in full by its path, as cited by search (the .md suffix is optional).",
+            "description": "Read one indexed document in full. Pass the path exactly as search cites it. Markdown files return their source; other formats (EPUB) return their text as Markdown headings. Omit the extension only for a markdown file.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "path": { "type": "string", "minLength": 1, "maxLength": MAX_PATH_CHARS } },
@@ -313,6 +313,55 @@ mod tests {
             let (_, r) = rpc(&f.app, call(3, name, args)).await;
             assert_eq!(r["result"]["isError"], true, "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn read_document_renders_an_epub_for_the_caller_too() {
+        use crate::app::tests::fixture_with_epub;
+        let f = fixture_with_epub();
+        let (_, read) = rpc(
+            &f.app,
+            call(1, "read_document", json!({"path":"Library/Some Book.epub"})),
+        )
+        .await;
+        assert_eq!(read["result"]["isError"], false, "{read}");
+        let text = read["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("# Replication Basics"), "{text}");
+        assert!(text.contains("## Chapter 5 Replication"), "{text}");
+        assert!(text.contains("Print a calibration cube first."), "{text}");
+        assert!(!text.contains("PK\u{3}\u{4}"), "zip bytes: {text}");
+
+        // Markdown is unchanged, and a path that is not indexed stays a tool error.
+        let (_, md) = rpc(
+            &f.app,
+            call(
+                2,
+                "read_document",
+                json!({ "path": "systems/fabrication/qidi" }),
+            ),
+        )
+        .await;
+        assert!(md["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("# Qidi Plus 4"));
+        for path in ["Library/Some Book", "secret.txt"] {
+            let (_, r) = rpc(&f.app, call(3, "read_document", json!({"path":path}))).await;
+            assert_eq!(r["result"]["isError"], true, "{path}");
+        }
+
+        // The tool no longer tells the caller that every file is markdown.
+        let (_, list) = rpc(
+            &f.app,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}),
+        )
+        .await;
+        let description = list["result"]["tools"][1]["description"].as_str().unwrap();
+        assert!(description.contains("EPUB"), "{description}");
+        assert!(
+            !description.contains(".md suffix is optional"),
+            "{description}"
+        );
     }
 
     #[cfg(unix)]
