@@ -1,18 +1,24 @@
 //! Format support: which file extensions a source reads, and the extractor that turns a file's
 //! bytes into a chunkable [`Document`]. A source chooses its formats; the build dispatches each
-//! file to the extractor registered for its extension. Markdown is the only extractor until the
-//! EPUB (#153) and PDF (#155) extractors are registered here.
+//! file to the extractor registered for its extension. Markdown and EPUB are the registered
+//! extractors; PDF (#155) will register itself here.
 
 use crate::chunk::{markdown_document, Document};
 use anyhow::{bail, Result};
 use std::path::Path;
 
-/// One format an index can read: its id, the extensions it covers, and the extractor that turns a
-/// matching file into a [`Document`]. An extractor error becomes a skip of that file (#150).
+/// One format an index can read: its id, the extensions it covers, the largest file it can
+/// read, how an oversized file is handled, and the extractor that turns a matching file into a
+/// [`Document`]. An extractor error becomes a skip of that file (#150).
 #[derive(Clone, Copy, Debug)]
 pub struct Format {
     pub id: &'static str,
     pub extensions: &'static [&'static str],
+    /// The largest file this format reads, in bytes.
+    pub max_bytes: u64,
+    /// Whether an oversized file reaches the build, which then skips it with a reason (#150),
+    /// or is dropped by the walk as though it were not there (the markdown behaviour).
+    pub report_oversize: bool,
     pub extract: fn(&str, &[u8]) -> Result<Document>,
 }
 
@@ -23,13 +29,37 @@ pub fn markdown(_path: &str, bytes: &[u8]) -> Result<Document> {
     Ok(markdown_document(_path, &text))
 }
 
-/// Every format this build knows about. New formats (EPUB, PDF) are registered here.
+/// Every format this build knows about. New formats (PDF) are registered here.
 pub fn formats() -> Vec<Format> {
-    vec![Format {
-        id: "md",
-        extensions: &["md"],
-        extract: markdown,
-    }]
+    vec![
+        Format {
+            id: "md",
+            extensions: &["md"],
+            max_bytes: crate::source::MAX_FILE_BYTES,
+            report_oversize: false,
+            extract: markdown,
+        },
+        Format {
+            id: "epub",
+            extensions: &["epub"],
+            max_bytes: 200 * 1024 * 1024,
+            report_oversize: true,
+            extract: crate::epub::epub,
+        },
+    ]
+}
+
+/// The format covering a path's extension, if any enabled format covers it.
+pub(crate) fn covering_format(formats: &[Format], path: &str) -> Option<Format> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    formats
+        .iter()
+        .find(|f| f.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)))
+        .copied()
 }
 
 /// Turn one file's bytes into a [`Document`], dispatching on its extension. A file whose
@@ -104,6 +134,8 @@ mod tests {
         formats.push(Format {
             id: "fake",
             extensions: &["fke"],
+            max_bytes: crate::source::MAX_FILE_BYTES,
+            report_oversize: false,
             extract: fake,
         });
         formats
@@ -117,9 +149,18 @@ mod tests {
     }
 
     #[test]
+    fn epub_is_a_registered_format() {
+        let formats = enabled_formats("epub").unwrap();
+        assert_eq!(
+            formats.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec!["epub"]
+        );
+    }
+
+    #[test]
     fn an_unknown_format_fails_the_parse_with_the_supported_list() {
-        let err = enabled_formats("epub").unwrap_err().to_string();
-        assert!(err.contains("unknown format epub"), "{err}");
+        let err = enabled_formats("pdf").unwrap_err().to_string();
+        assert!(err.contains("unknown format pdf"), "{err}");
         assert!(
             err.contains("md"),
             "supported values should be listed: {err}"
