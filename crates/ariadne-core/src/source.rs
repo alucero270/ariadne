@@ -90,9 +90,31 @@ pub fn walk_sources(
                 if !excluded(&format!("{rel}/"), excludes) {
                     stack.push((entry.path(), format!("{rel}/")));
                 }
-            } else if kind.is_file() && meta.len() <= MAX_FILE_BYTES && !excluded(&rel, excludes) {
-                match extension_of(&rel) {
-                    Some(ext) if formats_enabled(formats, &ext) => out.push(SourceFile {
+            } else if kind.is_file() && !excluded(&rel, excludes) {
+                // The size cap belongs to the format that covers the file: an oversized file of
+                // a format that reports oversize (`report_oversize`) reaches the build, which
+                // skips it with a reason (#150); otherwise it is dropped, exactly as the
+                // markdown walker always dropped it.
+                let ext = extension_of(&rel);
+                let covering = ext
+                    .as_ref()
+                    .and_then(|ext| formats.iter().find(|f| format_covers(f, ext)));
+                let limit = covering.map_or_else(
+                    || {
+                        formats
+                            .iter()
+                            .map(|f| f.max_bytes)
+                            .max()
+                            .unwrap_or(MAX_FILE_BYTES)
+                    },
+                    |f| f.max_bytes,
+                );
+                let over_limit = meta.len() > limit;
+                if over_limit && !covering.is_some_and(|f| f.report_oversize) {
+                    continue;
+                }
+                match ext {
+                    Some(_) if covering.is_some() => out.push(SourceFile {
                         rel,
                         abs: entry.path(),
                     }),
@@ -113,11 +135,12 @@ fn extension_of(rel: &str) -> Option<String> {
     rel.rsplit('.').next().map(|e| e.to_ascii_lowercase())
 }
 
-/// Whether `formats` covers a file with the given extension.
-fn formats_enabled(formats: &[Format], ext: &str) -> bool {
-    formats
+/// Whether `format` covers a file with the given extension.
+fn format_covers(format: &Format, ext: &str) -> bool {
+    format
+        .extensions
         .iter()
-        .any(|f| f.extensions.iter().any(|e| e.to_ascii_lowercase() == ext))
+        .any(|e| e.to_ascii_lowercase() == ext)
 }
 
 /// Resolve a repo-relative path to a regular, non-symlinked file inside `root`.
@@ -184,6 +207,8 @@ mod tests {
         let md: &mut [Format] = &mut [Format {
             id: "md",
             extensions: &["md"],
+            max_bytes: MAX_FILE_BYTES,
+            report_oversize: false,
             extract: crate::extract::markdown,
         }];
         let mut ignored = BTreeMap::new();

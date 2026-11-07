@@ -5,7 +5,7 @@
 //! answering while a writer rebuilds, and pick up the new data once the rebuild commits.
 
 use crate::chunk::{chunk_document, reference, Chunk};
-use crate::extract::{enabled_formats, extract, Format};
+use crate::extract::{covering_format, enabled_formats, extract, Format};
 use crate::ports::{normalize, Embedder, Models};
 use crate::rank::{cap_per_key, fts_query, fuse};
 use crate::source::{resolve_inside, walk_sources, DEFAULT_EXCLUDES};
@@ -337,6 +337,23 @@ impl Index {
         let mut seen = HashSet::new();
         for file in &files {
             seen.insert(file.rel.clone());
+            // A format may allow files bigger than the ordinary cap into the walk so the build
+            // can report them (`report_oversize`): check the size here, before reading, and
+            // skip with a reason (#150).
+            if let Some(format) =
+                covering_format(self.source.formats(), &file.rel).filter(|f| f.report_oversize)
+            {
+                let len = std::fs::metadata(&file.abs).map(|m| m.len()).unwrap_or(0);
+                if len > format.max_bytes {
+                    let reason = format!(
+                        "file over the {} MB limit",
+                        format.max_bytes / (1024 * 1024)
+                    );
+                    eprintln!("warning: skipping {}: {reason}", file.rel);
+                    skipped.push((file.rel.clone(), reason));
+                    continue;
+                }
+            }
             let raw = match std::fs::read(&file.abs) {
                 Ok(raw) => raw,
                 Err(e) => {
@@ -1465,6 +1482,8 @@ pub(crate) mod tests {
         let md = || Format {
             id: "md",
             extensions: &["md"],
+            max_bytes: crate::source::MAX_FILE_BYTES,
+            report_oversize: false,
             extract: crate::extract::markdown,
         };
         let with_fake = vec![
@@ -1472,6 +1491,8 @@ pub(crate) mod tests {
             Format {
                 id: "fke",
                 extensions: &["fke"],
+                max_bytes: crate::source::MAX_FILE_BYTES,
+                report_oversize: false,
                 extract: fake_extract,
             },
         ];
@@ -1517,5 +1538,117 @@ pub(crate) mod tests {
         let err = enabled_formats("pdf").unwrap_err().to_string();
         assert!(err.contains("unknown format pdf"), "{err}");
         assert!(err.contains("md"), "supported values listed: {err}");
+    }
+
+    // EPUB (#153): enabling the format indexes books beside the markdown; the default formats
+    // ignore them exactly as `main` ignores any uncovered extension; an over-limit book is
+    // skipped with a reason (#150).
+    fn md_format() -> Format {
+        crate::extract::formats()
+            .into_iter()
+            .find(|f| f.id == "md")
+            .unwrap()
+    }
+
+    fn epub_format() -> Format {
+        crate::extract::formats()
+            .into_iter()
+            .find(|f| f.id == "epub")
+            .unwrap()
+    }
+
+    #[test]
+    fn an_epub_indexes_beside_markdown_and_cites_its_chapters() {
+        let f = Fixture::new();
+        crate::epub::fixtures::write_epub(
+            f.src.path(),
+            "Library/Some Book.epub",
+            &crate::epub::fixtures::epub3_nav(),
+        );
+        let mut idx = Index::open(
+            &f.db.path().join("i.db"),
+            Source::new(f.src.path()).with_formats(vec![md_format(), epub_format()]),
+            Models::default(),
+        )
+        .unwrap();
+        let stats = idx.build().unwrap();
+        // The two markdown fixtures and the book all index.
+        assert_eq!(
+            (stats.files_seen, stats.files_changed, stats.files_skipped),
+            (3, 3, 0)
+        );
+        let book = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "Library/Some Book.epub")
+            .unwrap();
+        assert_eq!(book.status, FileState::Indexed);
+        assert!(
+            book.chunks >= 4,
+            "one section per chapter heading: {book:?}"
+        );
+
+        let hits = idx
+            .search("replication calibration cube", &opts(Mode::Bm25, 5))
+            .unwrap();
+        // The citation keeps the `.epub` extension and carries the chapter anchor.
+        assert!(
+            hits.iter()
+                .any(|h| h.reference == "Library/Some Book.epub#Chapter 5 Replication"),
+            "{:?}",
+            hits.iter().map(|h| &h.reference).collect::<Vec<_>>()
+        );
+        // Markdown references still drop the `.md` suffix in the same index.
+        let md_hit = idx.search("moonraker", &opts(Mode::Bm25, 1)).unwrap();
+        assert!(md_hit[0].reference.starts_with("systems/fabrication/qidi#"));
+    }
+
+    #[test]
+    fn an_over_limit_book_is_skipped_with_a_reason() {
+        let f = Fixture::new();
+        let path = f.src.path().join("Library/Huge Book.epub");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A 201 MiB sparse file: instant to create, and past the epub format's 200 MiB cap.
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(201 * 1024 * 1024).unwrap();
+        let mut idx = Index::open(
+            &f.db.path().join("i.db"),
+            Source::new(f.src.path()).with_formats(vec![md_format(), epub_format()]),
+            Models::default(),
+        )
+        .unwrap();
+        let stats = idx.build().unwrap();
+        assert_eq!(stats.files_skipped, 1);
+        let huge = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "Library/Huge Book.epub")
+            .unwrap();
+        assert_eq!(huge.status, FileState::Skipped);
+        let reason = huge.reason.unwrap();
+        assert!(reason.contains("over the 200 MB limit"), "{reason}");
+        // The rest of the source still indexes.
+        assert_eq!(stats.files_changed, 2);
+    }
+
+    #[test]
+    fn the_default_formats_ignore_epub_files() {
+        let f = Fixture::new();
+        crate::epub::fixtures::write_epub(
+            f.src.path(),
+            "Library/Some Book.epub",
+            &crate::epub::fixtures::epub3_nav(),
+        );
+        let mut idx = f.open(false); // the default: markdown only
+        let stats = idx.build().unwrap();
+        assert_eq!(stats.ignored.get("epub"), Some(&1));
+        assert_eq!(stats.files_changed, 2);
+        assert!(idx
+            .files()
+            .unwrap()
+            .iter()
+            .all(|x| !x.path.ends_with(".epub")));
     }
 }
