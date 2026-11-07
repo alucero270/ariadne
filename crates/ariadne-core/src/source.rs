@@ -1,6 +1,8 @@
 //! Walking one source root. Symlinks are never followed, so nothing outside the root is read.
 
+use crate::extract::Format;
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -53,7 +55,17 @@ fn excluded(rel: &str, excludes: &[String]) -> bool {
     excludes.iter().any(|pat| glob_match(pat, rel))
 }
 
-pub fn walk_markdown(root: &Path, excludes: &[String]) -> Result<Vec<SourceFile>> {
+/// Walk the source and return the files whose extension is covered by `formats`, in a stable
+/// order. The symlink and exclude rules are exactly the markdown walker's; the only difference
+/// is that the kept set is "an enabled format" instead of `.md`. Files with a disabled extension
+/// are not returned, but their count, keyed by extension (without the dot), is accumulated in
+/// `ignored`, so the caller can report them without keeping the list.
+pub fn walk_sources(
+    root: &Path,
+    excludes: &[String],
+    formats: &[Format],
+    ignored: &mut BTreeMap<String, usize>,
+) -> Result<Vec<SourceFile>> {
     let root = root
         .canonicalize()
         .with_context(|| format!("source root {} is not readable", root.display()))?;
@@ -78,20 +90,34 @@ pub fn walk_markdown(root: &Path, excludes: &[String]) -> Result<Vec<SourceFile>
                 if !excluded(&format!("{rel}/"), excludes) {
                     stack.push((entry.path(), format!("{rel}/")));
                 }
-            } else if kind.is_file()
-                && name.ends_with(".md")
-                && meta.len() <= MAX_FILE_BYTES
-                && !excluded(&rel, excludes)
-            {
-                out.push(SourceFile {
-                    rel,
-                    abs: entry.path(),
-                });
+            } else if kind.is_file() && meta.len() <= MAX_FILE_BYTES && !excluded(&rel, excludes) {
+                match extension_of(&rel) {
+                    Some(ext) if formats_enabled(formats, &ext) => out.push(SourceFile {
+                        rel,
+                        abs: entry.path(),
+                    }),
+                    Some(ext) => {
+                        *ignored.entry(ext).or_insert(0) += 1;
+                    }
+                    None => {}
+                }
             }
         }
     }
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
+}
+
+/// The lower-cased extension of `rel` without the dot, if it has one.
+fn extension_of(rel: &str) -> Option<String> {
+    rel.rsplit('.').next().map(|e| e.to_ascii_lowercase())
+}
+
+/// Whether `formats` covers a file with the given extension.
+fn formats_enabled(formats: &[Format], ext: &str) -> bool {
+    formats
+        .iter()
+        .any(|f| f.extensions.iter().any(|e| e.to_ascii_lowercase() == ext))
 }
 
 /// Resolve a repo-relative path to a regular, non-symlinked file inside `root`.
@@ -155,12 +181,20 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("missing.md"), root.join("dangling.md"))
             .unwrap();
 
-        let rels: Vec<_> = walk_markdown(&root, &defaults())
+        let md: &mut [Format] = &mut [Format {
+            id: "md",
+            extensions: &["md"],
+            extract: crate::extract::markdown,
+        }];
+        let mut ignored = BTreeMap::new();
+        let rels: Vec<_> = walk_sources(&root, &defaults(), md, &mut ignored)
             .unwrap()
             .into_iter()
             .map(|f| f.rel)
             .collect();
         assert_eq!(rels, ["README.md", "docs/sub/a.md"]);
+        // The disabled-extension file is counted, not indexed.
+        assert_eq!(ignored.get("txt"), Some(&1));
     }
 
     #[test]
