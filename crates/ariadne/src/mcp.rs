@@ -1,6 +1,10 @@
 //! MCP front end: JSON-RPC 2.0 over HTTP POST, exposing `search` and `read_document`.
 
-use crate::app::{App, AppError, SearchRequest, MAX_K, MAX_PATH_CHARS, MAX_QUERY_CHARS};
+use crate::app::{
+    parse_file_status, App, AppError, SearchRequest, DEFAULT_FILE_LIMIT, MAX_FILE_LIMIT, MAX_K,
+    MAX_PATH_CHARS, MAX_QUERY_CHARS,
+};
+use ariadne_core::FileState;
 use axum::{http::StatusCode, response::IntoResponse, response::Response, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -39,6 +43,7 @@ pub async fn handle(app: &Arc<App>, body: Option<Json<Value>>) -> Response {
             let outcome = match name {
                 "search" => search(app, &args).await,
                 "read_document" => read_document(app, &args).await,
+                "list_documents" => list_documents(app, &args).await,
                 _ => return error(&id, -32602, &format!("unknown tool: {name}")),
             };
             let (text, is_error) = match outcome {
@@ -93,6 +98,20 @@ fn tools() -> Value {
                 "required": ["path"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "list_documents",
+            "description": "List the files in the index with each one's status, to answer 'what is indexed, and what failed to index and why?'. Filter by status (indexed or skipped) and/or a path prefix; paginate with limit (default 200, capped at 1000) and offset. Skipped files carry the reason they were left out.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["indexed", "skipped"] },
+                    "prefix": { "type": "string", "maxLength": MAX_PATH_CHARS },
+                    "limit": { "type": "integer", "minimum": 1, "default": DEFAULT_FILE_LIMIT, "maximum": MAX_FILE_LIMIT },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                },
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -143,6 +162,48 @@ async fn read_document(app: &Arc<App>, args: &Value) -> Result<String, AppError>
         .ok_or_else(|| AppError::BadRequest("path must be a string".into()))?;
     let text = app.read_document(path.to_string()).await?;
     Ok(truncate_chars(&text, DOCUMENT_CHARS))
+}
+
+async fn list_documents(app: &Arc<App>, args: &Value) -> Result<String, AppError> {
+    let status = match args["status"].as_str() {
+        None => None,
+        Some(v) => Some(parse_file_status(v)?),
+    };
+    let prefix = args["prefix"].as_str().map(str::to_string);
+    let limit = match &args["limit"] {
+        Value::Null => None,
+        v => Some(
+            v.as_u64()
+                .ok_or_else(|| AppError::BadRequest("limit must be a positive integer".into()))?,
+        ),
+    };
+    let offset =
+        match &args["offset"] {
+            Value::Null => None,
+            v => Some(v.as_u64().ok_or_else(|| {
+                AppError::BadRequest("offset must be a non-negative integer".into())
+            })?),
+        };
+    let list = app.files(status, prefix, limit, offset).await?;
+    let mut out = format!(
+        "{} file(s) match; showing {}:\n",
+        list.total,
+        list.files.len()
+    );
+    for f in &list.files {
+        let state = match f.status {
+            FileState::Indexed => "indexed",
+            FileState::Skipped => "skipped",
+        };
+        match f.reason.as_deref() {
+            Some(reason) => out.push_str(&format!("{}  {state}  reason={reason}\n", f.path)),
+            None => out.push_str(&format!(
+                "{}  {state}  chunks={} chars={}\n",
+                f.path, f.chunks, f.chars
+            )),
+        }
+    }
+    Ok(out.trim_end().to_string())
 }
 
 /// What a tool caller may see: our own messages for their mistakes, nothing internal.
@@ -217,7 +278,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["search", "read_document"]);
+        assert_eq!(names, ["search", "read_document", "list_documents"]);
     }
 
     #[tokio::test]
@@ -252,6 +313,61 @@ mod tests {
             let (_, r) = rpc(&f.app, call(3, name, args)).await;
             assert_eq!(r["result"]["isError"], true, "{name}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_documents_lists_filters_and_reports_mistakes_as_errors() {
+        use crate::app::tests::fixture_with_skipped;
+        let f = fixture_with_skipped();
+
+        // The tool is listed alongside search and read_document.
+        let (_, list) = rpc(
+            &f.app,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let names: Vec<_> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["search", "read_document", "list_documents"]);
+
+        // A call returns the same rows the HTTP /files route does.
+        let (_, rows) = rpc(&f.app, call(2, "list_documents", json!({}))).await;
+        assert_eq!(rows["result"]["isError"], false, "{rows}");
+        let text = rows["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.starts_with("3 file(s) match"), "{text}");
+        for p in [
+            "systems/fabrication/qidi.md",
+            "systems/locked.md",
+            "tools/bench.md",
+        ] {
+            assert!(text.contains(p), "missing {p} in:\n{text}");
+        }
+        assert!(text.contains("systems/locked.md  skipped"), "{text}");
+
+        // The status filter narrows it, like the HTTP route.
+        let (_, skipped) = rpc(
+            &f.app,
+            call(3, "list_documents", json!({"status":"skipped"})),
+        )
+        .await;
+        let stext = skipped["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(stext.contains("systems/locked.md"), "{stext}");
+        assert!(!stext.contains("tools/bench.md"), "{stext}");
+
+        // A bad argument is a tool error, not a crash.
+        let (_, bad) = rpc(&f.app, call(4, "list_documents", json!({"status":"bogus"}))).await;
+        assert_eq!(bad["result"]["isError"], true, "{bad}");
     }
 
     #[tokio::test]
