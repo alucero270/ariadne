@@ -291,12 +291,14 @@ impl Index {
 
         // Read and chunk changed documents. No write lock is held until the last step. A file
         // that cannot be read or chunked is recorded as skipped with a warning, and the build
-        // moves on. Only store and transaction errors fail the build.
+        // moves on. Only store and transaction errors fail the build. A file only enters `seen`
+        // once it has been read, so a previously indexed file that has become unreadable falls
+        // out of `seen` and its stale `files` row and chunks are deleted by the gone cleanup
+        // below; the next successful build re-indexes it.
         let mut changed = Vec::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         let mut seen = HashSet::new();
         for file in &files {
-            seen.insert(file.rel.clone());
             let raw = match std::fs::read(&file.abs) {
                 Ok(raw) => raw,
                 Err(e) => {
@@ -305,6 +307,7 @@ impl Index {
                     continue;
                 }
             };
+            seen.insert(file.rel.clone());
             let sha = format!("{:x}", Sha256::digest(&raw));
             if known.get(&file.rel) == Some(&sha) {
                 continue;
@@ -910,11 +913,16 @@ pub(crate) mod tests {
             fs::Permissions::from_mode(0o0),
         )
         .unwrap();
+        if fs::read(f.src.path().join("locked.md")).is_ok() {
+            eprintln!("note: mode 000 is still readable (running as root?); skipping test");
+            return;
+        }
         let mut idx = f.open(false);
         let stats = idx.build().unwrap();
         // The unreadable file is skipped; the two fixture files still index.
         assert_eq!(stats.files_skipped, 1);
         assert_eq!(stats.files_changed, 2);
+        assert_no_duplicate_paths(&idx.files().unwrap());
 
         let locked = idx
             .files()
@@ -949,6 +957,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(idx.build().unwrap().files_changed, 1);
+        assert_no_duplicate_paths(&idx.files().unwrap());
         let locked = idx
             .files()
             .unwrap()
@@ -966,6 +975,7 @@ pub(crate) mod tests {
         let mut idx = f.open(false);
         idx.build().unwrap();
         let files = idx.files().unwrap();
+        assert_no_duplicate_paths(&files);
         // One entry per indexed file, sorted by path.
         assert_eq!(
             files.iter().map(|x| x.path.as_str()).collect::<Vec<_>>(),
@@ -986,6 +996,74 @@ pub(crate) mod tests {
         let voice = files.iter().find(|x| x.path == "voice.md").unwrap();
         assert_eq!(voice.chunks, 1);
         assert_eq!(idx.stats().unwrap().skipped, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_previously_indexed_file_that_becomes_unreadable_is_skipped_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.write(
+            "vault.md",
+            "# Vault\n\nThe humming floor hides the copper coil.\n",
+        );
+        let mut idx = f.open(false);
+        assert_eq!(idx.build().unwrap().files_skipped, 0);
+        assert!(idx
+            .search("humming", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .iter()
+            .any(|h| h.path == "vault.md"));
+
+        fs::set_permissions(
+            f.src.path().join("vault.md"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        if fs::read(f.src.path().join("vault.md")).is_ok() {
+            eprintln!("note: mode 000 is still readable (running as root?); skipping test");
+            return;
+        }
+        assert_eq!(idx.build().unwrap().files_skipped, 1);
+
+        // The file is listed exactly once, as skipped; its stale chunks are gone from search.
+        let files = idx.files().unwrap();
+        assert_no_duplicate_paths(&files);
+        let vaults: Vec<&FileStatus> = files.iter().filter(|x| x.path == "vault.md").collect();
+        assert_eq!(vaults.len(), 1, "vault.md listed once: {files:?}");
+        assert_eq!(vaults[0].status, FileState::Skipped);
+        assert_eq!(vaults[0].chunks, 0);
+        assert!(vaults[0].reason.is_some());
+        assert!(idx
+            .search("humming", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .iter()
+            .all(|h| h.path != "vault.md"));
+
+        // The next successful build re-indexes it.
+        fs::set_permissions(
+            f.src.path().join("vault.md"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(idx.build().unwrap().files_changed, 1);
+        let vault = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "vault.md")
+            .unwrap();
+        assert_eq!(vault.status, FileState::Indexed);
+    }
+
+    /// A path must appear at most once in `Index::files`: an indexed row and a skipped row for
+    /// the same file would list it twice.
+    fn assert_no_duplicate_paths(files: &[FileStatus]) {
+        let mut paths: Vec<&str> = files.iter().map(|x| x.path.as_str()).collect();
+        paths.sort_unstable();
+        let before = paths.len();
+        paths.dedup();
+        assert_eq!(paths.len(), before, "a path appears twice: {files:?}");
     }
 
     #[test]
