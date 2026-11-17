@@ -241,10 +241,6 @@ pub fn chunk_document(path: &str, document: &Document, max_chars: usize) -> Vec<
     chunks
 }
 
-pub fn chunk_markdown(path: &str, text: &str, max_chars: usize) -> Vec<Chunk> {
-    chunk_document(path, &markdown_document(path, text), max_chars)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,9 +254,13 @@ mod tests {
         assert_eq!(strip_frontmatter("---\nunclosed"), "---\nunclosed");
     }
 
+    fn md_chunks(path: &str, text: &str, max_chars: usize) -> Vec<Chunk> {
+        chunk_document(path, &markdown_document(path, text), max_chars)
+    }
+
     #[test]
     fn headings_titles_and_fences() {
-        let chunks = chunk_markdown("systems/fab/qidi.md", DOC, 1200);
+        let chunks = md_chunks("systems/fab/qidi.md", DOC, 1200);
         let headings: Vec<_> = chunks.iter().map(|c| c.heading.as_str()).collect();
         assert_eq!(
             headings,
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn untitled_file_uses_stem_and_ignores_hashtags() {
-        let chunks = chunk_markdown("notes/todo.md", "#tag not heading\n\ntext", 1200);
+        let chunks = md_chunks("notes/todo.md", "#tag not heading\n\ntext", 1200);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].title, "todo");
         assert_eq!(chunks[0].heading, "");
@@ -297,7 +297,7 @@ mod tests {
             .map(|i| format!("paragraph {i} {}", "word ".repeat(50)))
             .collect();
         let text = format!("# T\n\n## S\n\n{}", body.join("\n\n"));
-        let chunks = chunk_markdown("a.md", &text, 600);
+        let chunks = md_chunks("a.md", &text, 600);
         assert!(chunks.len() > 1);
         assert!(chunks
             .iter()
@@ -307,14 +307,14 @@ mod tests {
     #[test]
     fn oversized_paragraph_is_hard_split_on_char_boundaries() {
         let text = format!("# T\n\n{}", "é".repeat(1000));
-        let chunks = chunk_markdown("a.md", &text, 300);
+        let chunks = md_chunks("a.md", &text, 300);
         assert_eq!(chunks.len(), 4);
         assert!(chunks.iter().all(|c| c.body.chars().count() <= 300));
     }
 
     #[test]
     fn crlf_is_normalized() {
-        let chunks = chunk_markdown("a.md", "# T\r\n\r\n## S\r\n\r\nline\r\n", 1200);
+        let chunks = md_chunks("a.md", "# T\r\n\r\n## S\r\n\r\nline\r\n", 1200);
         assert_eq!(chunks[0].body, "line");
     }
 
@@ -569,7 +569,7 @@ mod tests {
         assert!(fixtures.len() >= 20, "expected the crate's fixtures");
         for (path, text, max_chars) in &fixtures {
             let before = chunk_markdown_before(path, text, *max_chars);
-            let after = chunk_markdown(path, text, *max_chars);
+            let after = md_chunks(path, text, *max_chars);
             assert_eq!(before, after, "chunks changed for {path}");
             assert!(!before.iter().any(|c| c.body.is_empty()));
         }

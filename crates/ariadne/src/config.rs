@@ -4,7 +4,7 @@
 use crate::app::App;
 use crate::upstream::{HttpContextualizer, HttpEmbedder, HttpReranker};
 use anyhow::{bail, Context, Result};
-use ariadne_core::{BuildStats, Index, Models, Source};
+use ariadne_core::{enabled_formats, BuildStats, Index, Models, Source};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,6 +54,10 @@ pub struct Settings {
     /// Largest chunk, in characters, before a section is split at paragraph boundaries.
     #[arg(long, global = true)]
     pub max_chars: Option<usize>,
+    /// Comma-separated formats to index (e.g. `md`); the default is `md`. An unknown value is a
+    /// startup error that lists the supported values.
+    #[arg(long, env = "ARIADNE_FORMATS", global = true)]
+    pub formats: Option<String>,
 }
 
 /// An OpenAI-compatible endpoint and the model to ask for.
@@ -85,6 +89,8 @@ impl Config {
             Some(n) => Source::new(root).with_max_chars(n),
             None => Source::new(root),
         };
+        let formats = enabled_formats(settings.formats.as_deref().unwrap_or_default())?;
+        let source = source.with_formats(formats);
         Ok(Self {
             db: settings.db,
             source,
