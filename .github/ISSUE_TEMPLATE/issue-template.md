@@ -19,12 +19,12 @@ This issue should describe exactly one reviewable change.
 - Type:
   - feature / bug / infra / refactor / docs / test / perf
 - Area:
-  - architecture / api / indexer / embedder / db / web / ops / repo
+  - api / indexer / core / search / embedder / ops / repo
 - Priority:
   - low / normal / high
 - Files involved (if known):
-  - `path/to/file.cs`
-  - `ops/docker-compose.yml`
+  - `crates/ariadne-core/src/index.rs`
+  - `ops/ariadne/compose.yml`
 
 Keep the scope narrow. Do not combine unrelated work in one issue.
 
