@@ -330,7 +330,6 @@ impl Index {
         };
 
         // Read and chunk changed documents. No write lock is held until the last step. A file
-        // Read and chunk changed documents. No write lock is held until the last step. A file
         // that cannot be read or extracted is recorded as skipped with a warning, and the build
         // moves on. Only store and transaction errors fail the build. A file only enters `seen`
         // once it has been read, so a previously indexed file that has become unreadable falls
