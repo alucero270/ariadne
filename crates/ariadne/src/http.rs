@@ -290,6 +290,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn documents_route_returns_an_epub_as_text() {
+        let f = crate::app::tests::fixture_with_epub();
+        let router = router(f.app.clone(), None);
+        let (status, body) = send(
+            &router,
+            "GET",
+            "/documents?path=Library/Some%20Book.epub",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["path"], "Library/Some Book.epub");
+        let text = body["text"].as_str().unwrap();
+        assert!(text.starts_with("# Replication Basics"), "{text}");
+        assert!(text.contains("## Chapter 1 Setup"), "{text}");
+        assert!(text.contains("level the bed"), "{text}");
+        assert!(!text.bytes().any(|b| b == 0), "zip bytes: {text:?}");
+
+        // A markdown path is still served as its source, and an epub path without its
+        // extension is 404 like any other unreadable path.
+        let (status, body) = send(
+            &router,
+            "GET",
+            "/documents?path=systems/fabrication/qidi",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["text"].as_str().unwrap().starts_with("# Qidi Plus 4"));
+        for path in ["Library/Some%20Book", "../etc/passwd"] {
+            assert_eq!(
+                send(&router, "GET", &format!("/documents?path={path}"), None)
+                    .await
+                    .0,
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn files_route_lists_filters_paginates_and_validates() {

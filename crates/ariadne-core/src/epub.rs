@@ -818,10 +818,10 @@ fn file_stem(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Test fixtures: small made-up EPUB archives built with the zip writer. Nothing here is
-/// third-party content; every book is fictional and every path is invented.
-#[cfg(test)]
-pub(crate) mod fixtures {
+/// Small made-up EPUB fixtures, used by tests: archives built with the zip writer. Nothing
+/// here is third-party content; every book is fictional and every path is invented. They are
+/// public so tests in other crates can index a book too.
+pub mod fixtures {
     use std::io::{Cursor, Write};
     use std::path::Path;
     use zip::write::SimpleFileOptions;
