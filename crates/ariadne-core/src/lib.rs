@@ -11,6 +11,7 @@ pub mod epub;
 mod eval;
 mod extract;
 mod index;
+mod pdf;
 mod ports;
 mod rank;
 mod source;

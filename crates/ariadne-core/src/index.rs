@@ -1729,8 +1729,8 @@ pub(crate) mod tests {
     #[test]
     fn a_unknown_format_is_a_startup_error_that_lists_the_supported_values() {
         assert!(enabled_formats("md").is_ok());
-        let err = enabled_formats("pdf").unwrap_err().to_string();
-        assert!(err.contains("unknown format pdf"), "{err}");
+        let err = enabled_formats("docx").unwrap_err().to_string();
+        assert!(err.contains("unknown format docx"), "{err}");
         assert!(err.contains("md"), "supported values listed: {err}");
     }
 
