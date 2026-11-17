@@ -1,6 +1,6 @@
 //! HTTP front end: the REST routes, the MCP route, and bearer-token auth.
 
-use crate::app::{App, AppError, SearchRequest};
+use crate::app::{parse_file_status, App, AppError, FileList, SearchRequest};
 use crate::mcp;
 use axum::{
     extract::{DefaultBodyLimit, Query, Request, State},
@@ -49,6 +49,7 @@ pub fn router(app: Arc<App>, token: Option<String>) -> Router {
     let protected = Router::new()
         .route("/search", get(search))
         .route("/documents", get(document))
+        .route("/files", get(files))
         .route("/reindex", post(reindex))
         .route(
             "/mcp",
@@ -151,6 +152,30 @@ async fn document(
 async fn reindex(State(s): State<HttpState>) -> Result<Json<Value>, AppError> {
     let stats = s.app.reindex().await?;
     Ok(Json(json!({ "status": "ok", "stats": stats })))
+}
+
+#[derive(Deserialize)]
+struct FilesParams {
+    status: Option<String>,
+    prefix: Option<String>,
+    // u64 so axum's query deserializer rejects non-integer and negative values with a 400.
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+/// What is indexed and what was skipped: `{ total, files }` filtered by status and path
+/// prefix, sorted by path, paginated by limit (default 200, capped at 1000) and offset.
+async fn files(
+    State(s): State<HttpState>,
+    Query(p): Query<FilesParams>,
+) -> Result<Json<FileList>, AppError> {
+    let status = match p.status.as_deref() {
+        None => None,
+        Some(v) => Some(parse_file_status(v)?),
+    };
+    Ok(Json(
+        s.app.files(status, p.prefix, p.limit, p.offset).await?,
+    ))
 }
 
 async fn mcp_route(State(s): State<HttpState>, body: Option<Json<Value>>) -> Response {
@@ -263,6 +288,93 @@ mod tests {
             send(&router, "POST", "/reindex", None).await.1["stats"]["files_changed"],
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn files_route_lists_filters_paginates_and_validates() {
+        let f = crate::app::tests::fixture_with_skipped();
+        let router = router(f.app.clone(), Some(TOKEN.into()));
+
+        // Token-protected like /search.
+        assert_eq!(
+            send(&router, "GET", "/files", None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(&router, "GET", "/files", Some("wrong")).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let (status, body) = send(&router, "GET", "/files", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 3);
+        let files = body["files"].as_array().unwrap();
+        let paths: Vec<_> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(
+            paths,
+            [
+                "systems/fabrication/qidi.md",
+                "systems/locked.md",
+                "tools/bench.md"
+            ]
+        );
+        assert_eq!(files[0]["status"], "indexed");
+        assert!(files[0]["chunks"].as_i64().unwrap() > 0);
+        assert!(files[0].get("reason").is_none(), "reason only when Some");
+        assert_eq!(files[1]["status"], "skipped");
+        assert!(files[1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Permission denied"));
+
+        // Status and prefix filters change total, not just the slice.
+        let (_, body) = send(&router, "GET", "/files?status=skipped", Some(TOKEN)).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["files"][0]["path"], "systems/locked.md");
+        let (_, body) = send(&router, "GET", "/files?status=indexed", Some(TOKEN)).await;
+        assert_eq!(body["total"], 2);
+        let (_, body) = send(&router, "GET", "/files?prefix=systems/", Some(TOKEN)).await;
+        assert_eq!(body["total"], 2);
+        let (_, body) = send(
+            &router,
+            "GET",
+            "/files?status=indexed&prefix=tools/",
+            Some(TOKEN),
+        )
+        .await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["files"][0]["path"], "tools/bench.md");
+
+        // Pagination: total is pre-pagination, files is the slice.
+        let (_, body) = send(&router, "GET", "/files?limit=1&offset=1", Some(TOKEN)).await;
+        assert_eq!(body["total"], 3);
+        assert_eq!(body["files"].as_array().unwrap().len(), 1);
+        assert_eq!(body["files"][0]["path"], "systems/locked.md");
+        let (_, body) = send(&router, "GET", "/files?limit=2&offset=3", Some(TOKEN)).await;
+        assert_eq!(body["total"], 3);
+        assert!(body["files"].as_array().unwrap().is_empty());
+        // A limit above the cap is clamped, not refused; with only three files the whole
+        // list comes back. The clamp itself (1001 -> 1000) is asserted in app::tests.
+        let (status, body) = send(&router, "GET", "/files?limit=1001", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["files"].as_array().unwrap().len(), 3);
+
+        // Caller mistakes: bad status values and bad limit/offset are 400s.
+        for bad in [
+            "/files?status=bogus",
+            "/files?limit=0",
+            "/files?limit=-1",
+            "/files?limit=abc",
+            "/files?offset=-1",
+            "/files?offset=abc",
+        ] {
+            assert_eq!(
+                send(&router, "GET", bad, Some(TOKEN)).await.0,
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
+        }
     }
 
     #[test]
