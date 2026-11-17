@@ -163,8 +163,9 @@ mod tests {
         assert!(glob_match("a?c", "abc"));
     }
 
-    #[test]
-    fn walk_skips_excludes_symlinks_and_non_markdown() {
+    /// A source root with files that must be indexed, excluded, or ignored by extension, plus one
+    /// file outside the root for the escape cases.
+    fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         fs::create_dir_all(root.join("docs/sub")).unwrap();
@@ -176,22 +177,48 @@ mod tests {
         fs::write(root.join(".git/c.md"), "# c").unwrap();
         fs::write(root.join("x-artifacts/d.md"), "# d").unwrap();
         fs::write(dir.path().join("outside.md"), "# secret").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("outside.md"), root.join("link.md")).unwrap();
-        std::os::unix::fs::symlink(dir.path(), root.join("linkdir")).unwrap();
-        std::os::unix::fs::symlink(dir.path().join("missing.md"), root.join("dangling.md"))
-            .unwrap();
+        dir
+    }
 
+    /// `walk_sources` over the fixture with only Markdown enabled, plus the per-extension counts.
+    fn walked_rels(dir: &tempfile::TempDir) -> (Vec<String>, BTreeMap<String, usize>) {
         let md: &mut [Format] = &mut [Format {
             id: "md",
             extensions: &["md"],
             extract: crate::extract::markdown,
         }];
         let mut ignored = BTreeMap::new();
-        let rels: Vec<_> = walk_sources(&root, &defaults(), md, &mut ignored)
+        let rels: Vec<_> = walk_sources(&dir.path().join("repo"), &defaults(), md, &mut ignored)
             .unwrap()
             .into_iter()
             .map(|f| f.rel)
             .collect();
+        (rels, ignored)
+    }
+
+    #[test]
+    fn walk_skips_excludes_and_non_markdown() {
+        let dir = fixture();
+        let (rels, ignored) = walked_rels(&dir);
+        assert_eq!(rels, ["README.md", "docs/sub/a.md"]);
+        // The disabled-extension file is counted, not indexed.
+        assert_eq!(ignored.get("txt"), Some(&1));
+    }
+
+    /// Creating a symlink needs a privilege Windows does not always grant, so the symlink cases
+    /// run on Unix only. CI runs on Linux, so the "never follow a link" guarantee stays covered
+    /// there; on Windows it is verified by hand.
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_symlinks_and_dangling_links() {
+        let dir = fixture();
+        let root = dir.path().join("repo");
+        std::os::unix::fs::symlink(dir.path().join("outside.md"), root.join("link.md")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), root.join("linkdir")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing.md"), root.join("dangling.md"))
+            .unwrap();
+
+        let (rels, ignored) = walked_rels(&dir);
         assert_eq!(rels, ["README.md", "docs/sub/a.md"]);
         // The disabled-extension file is counted, not indexed.
         assert_eq!(ignored.get("txt"), Some(&1));
@@ -199,24 +226,33 @@ mod tests {
 
     #[test]
     fn resolve_inside_refuses_escapes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture();
         let root = dir.path().join("repo");
-        fs::create_dir_all(root.join("docs")).unwrap();
-        fs::write(root.join("docs/a.md"), "a").unwrap();
-        fs::write(dir.path().join("outside.md"), "x").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("outside.md"), root.join("link.md")).unwrap();
-        std::os::unix::fs::symlink(dir.path(), root.join("linkdir")).unwrap();
 
-        assert!(resolve_inside(&root, "docs/a.md").is_ok());
-        assert!(resolve_inside(&root, "/docs/a.md").is_ok());
+        assert!(resolve_inside(&root, "docs/sub/a.md").is_ok());
+        assert!(resolve_inside(&root, "/docs/sub/a.md").is_ok());
         for bad in [
             "../outside.md",
             "docs/../../outside.md",
-            "link.md",
-            "linkdir/outside.md",
             "docs",
             "missing.md",
         ] {
+            assert!(
+                resolve_inside(&root, bad).is_err(),
+                "{bad} should be refused"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_inside_refuses_symlinks() {
+        let dir = fixture();
+        let root = dir.path().join("repo");
+        std::os::unix::fs::symlink(dir.path().join("outside.md"), root.join("link.md")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), root.join("linkdir")).unwrap();
+
+        for bad in ["link.md", "linkdir/outside.md"] {
             assert!(
                 resolve_inside(&root, bad).is_err(),
                 "{bad} should be refused"
