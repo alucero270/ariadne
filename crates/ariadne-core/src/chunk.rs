@@ -393,6 +393,15 @@ mod tests {
     }
 
     #[test]
+    fn reference_keeps_the_extension_of_an_epub_citation() {
+        // `reference` strips only `.md`: an epub citation keeps its extension.
+        assert_eq!(
+            reference("Library/Some Book.epub", "Chapter 5 Replication"),
+            "Library/Some Book.epub#Chapter 5 Replication"
+        );
+    }
+
+    #[test]
     fn chunk_document_skips_a_document_whose_only_section_is_empty() {
         let doc = Document {
             title: "Mostly Blank".to_string(),

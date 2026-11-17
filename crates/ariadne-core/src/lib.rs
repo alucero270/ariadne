@@ -4,6 +4,7 @@
 //! then `search`, `read_document`, and `evaluate`. Everything else is implementation.
 
 mod chunk;
+mod epub;
 mod eval;
 mod extract;
 mod index;
