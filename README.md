@@ -83,7 +83,11 @@ dominate, so measure one book before projecting a library.
 
 - One source root per index. Nothing outside it is read, and symlinks are never followed.
 - Only files currently in the index can be read through Ariadne.
-- Markdown only, files up to 2 MiB, chunks up to 1200 characters (`--max-chars`, minimum 100).
+- Formats: `md` by default; `--formats md,epub,pdf` enables more. Markdown files up to 2 MiB,
+  EPUBs and PDFs up to 200 MiB (oversize ones are skipped with a reason, not fatal), chunks up
+  to 1200 characters (`--max-chars`, minimum 100). PDF parsing is poppler's `pdftotext`
+  (`poppler-utils`, in the image already); a page becomes one section, so a citation reads
+  `Paper.pdf#Page 3`, and a PDF with no text layer is skipped as scanned.
 - The index is derived: delete the database and it rebuilds from the source folder.
 - One writer and any number of readers may share a database; readers keep answering while a
   rebuild runs.
@@ -125,7 +129,7 @@ suite not exercised on a Windows checkout.
 
 ## Roadmap
 
-- More file formats: `txt`, `html`, `epub`, then text PDFs as best effort (#145).
+- File formats: `epub` and best-effort `pdf` are in; `txt` and `html` remain (#145).
 - A second instance, `ariadne-library`, indexing the ebook library keyword-only at first.
 
 Deployment is one instance per corpus: the docs index and the library never share a database, so

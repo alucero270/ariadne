@@ -1,7 +1,7 @@
 //! Format support: which file extensions a source reads, and the extractor that turns a file's
 //! bytes into a chunkable [`Document`]. A source chooses its formats; the build dispatches each
-//! file to the extractor registered for its extension. Markdown and EPUB are the registered
-//! extractors; PDF (#155) will register itself here.
+//! file to the extractor registered for its extension. Markdown, EPUB, and PDF are the
+//! registered extractors.
 
 use crate::chunk::{markdown_document, Document};
 use anyhow::{bail, Result};
@@ -29,7 +29,7 @@ pub fn markdown(_path: &str, bytes: &[u8]) -> Result<Document> {
     Ok(markdown_document(_path, &text))
 }
 
-/// Every format this build knows about. New formats (PDF) are registered here.
+/// Every format this build knows about. New formats are registered here.
 pub fn formats() -> Vec<Format> {
     vec![
         Format {
@@ -45,6 +45,13 @@ pub fn formats() -> Vec<Format> {
             max_bytes: 200 * 1024 * 1024,
             report_oversize: true,
             extract: crate::epub::epub,
+        },
+        Format {
+            id: "pdf",
+            extensions: &["pdf"],
+            max_bytes: 200 * 1024 * 1024,
+            report_oversize: true,
+            extract: crate::pdf::pdf,
         },
     ]
 }
@@ -215,11 +222,20 @@ mod tests {
 
     #[test]
     fn an_unknown_format_fails_the_parse_with_the_supported_list() {
-        let err = enabled_formats("pdf").unwrap_err().to_string();
-        assert!(err.contains("unknown format pdf"), "{err}");
+        let err = enabled_formats("docx").unwrap_err().to_string();
+        assert!(err.contains("unknown format docx"), "{err}");
         assert!(
             err.contains("md"),
             "supported values should be listed: {err}"
+        );
+    }
+
+    #[test]
+    fn pdf_is_a_registered_format() {
+        let formats = enabled_formats("md,pdf").unwrap();
+        assert_eq!(
+            formats.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec!["md", "pdf"]
         );
     }
 

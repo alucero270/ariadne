@@ -7,7 +7,7 @@ RUN cargo build --release --locked -p ariadne
 
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates poppler-utils \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 ariadne \
  && mkdir -p /data && chown ariadne /data
