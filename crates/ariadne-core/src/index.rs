@@ -156,6 +156,7 @@ pub struct BuildStats {
     pub files_seen: usize,
     pub files_changed: usize,
     pub files_removed: usize,
+    pub files_skipped: usize,
     pub chunks_written: usize,
     pub seconds: f64,
 }
@@ -164,9 +165,30 @@ pub struct BuildStats {
 pub struct IndexStats {
     pub files: i64,
     pub chunks: i64,
+    pub skipped: i64,
     pub embedder: Option<String>,
     pub reranker: Option<String>,
     pub indexed_at: Option<String>,
+}
+
+/// Whether one file in the source is in the index or was left out by the last build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileState {
+    Indexed,
+    Skipped,
+}
+
+/// One file's standing in the index, as reported by [`Index::files`]. `chunks` and `chars`
+/// are zero for a skipped file, whose `reason` says what went wrong.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FileStatus {
+    pub path: String,
+    pub status: FileState,
+    pub chunks: i64,
+    pub chars: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,12 +289,25 @@ impl Index {
             ..Default::default()
         };
 
-        // Read and chunk changed documents. No write lock is held until the last step.
+        // Read and chunk changed documents. No write lock is held until the last step. A file
+        // that cannot be read or chunked is recorded as skipped with a warning, and the build
+        // moves on. Only store and transaction errors fail the build. A file only enters `seen`
+        // once it has been read, so a previously indexed file that has become unreadable falls
+        // out of `seen` and its stale `files` row and chunks are deleted by the gone cleanup
+        // below; the next successful build re-indexes it.
         let mut changed = Vec::new();
+        let mut skipped: Vec<(String, String)> = Vec::new();
         let mut seen = HashSet::new();
         for file in &files {
+            let raw = match std::fs::read(&file.abs) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    eprintln!("warning: skipping {}: {e}", file.rel);
+                    skipped.push((file.rel.clone(), e.to_string()));
+                    continue;
+                }
+            };
             seen.insert(file.rel.clone());
-            let raw = std::fs::read(&file.abs)?;
             let sha = format!("{:x}", Sha256::digest(&raw));
             if known.get(&file.rel) == Some(&sha) {
                 continue;
@@ -286,6 +321,7 @@ impl Index {
                 chunks,
             });
         }
+        stats.files_skipped = skipped.len();
 
         self.add_contexts(&mut changed)?;
         let vectors = self.embed_documents(&changed, full)?;
@@ -309,6 +345,7 @@ impl Index {
             store::delete_file(&tx, gone)?;
             stats.files_removed += 1;
         }
+        store::replace_skipped(&tx, &skipped)?;
         for (key, value) in &settings {
             store::set_meta(&tx, key, value)?;
         }
@@ -448,14 +485,34 @@ impl Index {
     }
 
     pub fn stats(&self) -> Result<IndexStats> {
-        let (files, chunks) = store::counts(&self.conn)?;
+        let (files, chunks, skipped) = store::counts(&self.conn)?;
         Ok(IndexStats {
             files,
             chunks,
+            skipped,
             embedder: store::meta(&self.conn, "embedder")?,
             reranker: self.models.reranker.as_ref().map(|r| r.name()),
             indexed_at: store::meta(&self.conn, "indexed_at")?,
         })
+    }
+
+    /// Every file the index knows about, sorted by path: indexed files with their chunk
+    /// counts, skipped files with the reason from the last build.
+    pub fn files(&self) -> Result<Vec<FileStatus>> {
+        Ok(store::file_statuses(&self.conn)?
+            .into_iter()
+            .map(|(path, indexed, chunks, chars, reason)| FileStatus {
+                path,
+                status: if indexed {
+                    FileState::Indexed
+                } else {
+                    FileState::Skipped
+                },
+                chunks,
+                chars,
+                reason,
+            })
+            .collect())
     }
 
     /// Best chunks for `query`, cited. Hybrid mode fuses keyword and dense rankings; without an
@@ -843,6 +900,170 @@ pub(crate) mod tests {
             .iter()
             .all(|h| h.path != "voice.md"));
         assert_eq!(idx.stats().unwrap().files, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_skipped_and_the_rest_index() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.write("locked.md", "# Locked\n\nsecret vault\n");
+        fs::set_permissions(
+            f.src.path().join("locked.md"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        if fs::read(f.src.path().join("locked.md")).is_ok() {
+            eprintln!("note: mode 000 is still readable (running as root?); skipping test");
+            return;
+        }
+        let mut idx = f.open(false);
+        let stats = idx.build().unwrap();
+        // The unreadable file is skipped; the two fixture files still index.
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(stats.files_changed, 2);
+        assert_no_duplicate_paths(&idx.files().unwrap());
+
+        let locked = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "locked.md")
+            .unwrap();
+        assert_eq!(locked.status, FileState::Skipped);
+        assert_eq!(locked.chunks, 0);
+        assert!(
+            locked
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("Permission denied"),
+            "reason: {:?}",
+            locked.reason
+        );
+        let qidi = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "systems/fabrication/qidi.md")
+            .unwrap();
+        assert_eq!(qidi.status, FileState::Indexed);
+        assert!(qidi.chunks > 0);
+
+        // Fixing the file and rebuilding moves it from skipped to indexed.
+        fs::set_permissions(
+            f.src.path().join("locked.md"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(idx.build().unwrap().files_changed, 1);
+        assert_no_duplicate_paths(&idx.files().unwrap());
+        let locked = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "locked.md")
+            .unwrap();
+        assert_eq!(locked.status, FileState::Indexed);
+        assert_eq!(locked.chunks, 1);
+        assert_eq!(locked.reason, None);
+    }
+
+    #[test]
+    fn files_lists_indexed_with_counts_and_sorted_by_path() {
+        let f = Fixture::new();
+        let mut idx = f.open(false);
+        idx.build().unwrap();
+        let files = idx.files().unwrap();
+        assert_no_duplicate_paths(&files);
+        // One entry per indexed file, sorted by path.
+        assert_eq!(
+            files.iter().map(|x| x.path.as_str()).collect::<Vec<_>>(),
+            ["systems/fabrication/qidi.md", "voice.md"]
+        );
+        for x in &files {
+            assert_eq!(x.status, FileState::Indexed);
+            assert!(x.chunks > 0);
+            assert!(x.chars > 0);
+            assert_eq!(x.reason, None);
+        }
+        // PRINTER has three non-empty sections; VOICE has one.
+        let qidi = files
+            .iter()
+            .find(|x| x.path == "systems/fabrication/qidi.md")
+            .unwrap();
+        assert_eq!(qidi.chunks, 3);
+        let voice = files.iter().find(|x| x.path == "voice.md").unwrap();
+        assert_eq!(voice.chunks, 1);
+        assert_eq!(idx.stats().unwrap().skipped, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_previously_indexed_file_that_becomes_unreadable_is_skipped_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.write(
+            "vault.md",
+            "# Vault\n\nThe humming floor hides the copper coil.\n",
+        );
+        let mut idx = f.open(false);
+        assert_eq!(idx.build().unwrap().files_skipped, 0);
+        assert!(idx
+            .search("humming", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .iter()
+            .any(|h| h.path == "vault.md"));
+
+        fs::set_permissions(
+            f.src.path().join("vault.md"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        if fs::read(f.src.path().join("vault.md")).is_ok() {
+            eprintln!("note: mode 000 is still readable (running as root?); skipping test");
+            return;
+        }
+        assert_eq!(idx.build().unwrap().files_skipped, 1);
+
+        // The file is listed exactly once, as skipped; its stale chunks are gone from search.
+        let files = idx.files().unwrap();
+        assert_no_duplicate_paths(&files);
+        let vaults: Vec<&FileStatus> = files.iter().filter(|x| x.path == "vault.md").collect();
+        assert_eq!(vaults.len(), 1, "vault.md listed once: {files:?}");
+        assert_eq!(vaults[0].status, FileState::Skipped);
+        assert_eq!(vaults[0].chunks, 0);
+        assert!(vaults[0].reason.is_some());
+        assert!(idx
+            .search("humming", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .iter()
+            .all(|h| h.path != "vault.md"));
+
+        // The next successful build re-indexes it.
+        fs::set_permissions(
+            f.src.path().join("vault.md"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(idx.build().unwrap().files_changed, 1);
+        let vault = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "vault.md")
+            .unwrap();
+        assert_eq!(vault.status, FileState::Indexed);
+    }
+
+    /// A path must appear at most once in `Index::files`: an indexed row and a skipped row for
+    /// the same file would list it twice.
+    fn assert_no_duplicate_paths(files: &[FileStatus]) {
+        let mut paths: Vec<&str> = files.iter().map(|x| x.path.as_str()).collect();
+        paths.sort_unstable();
+        let before = paths.len();
+        paths.dedup();
+        assert_eq!(paths.len(), before, "a path appears twice: {files:?}");
     }
 
     #[test]

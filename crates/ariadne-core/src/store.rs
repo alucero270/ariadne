@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS chunks(
 CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(location, context, body, tokenize='porter unicode61');
 CREATE TABLE IF NOT EXISTS contexts(key TEXT PRIMARY KEY, context TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS skipped(path TEXT PRIMARY KEY, reason TEXT NOT NULL);
 ";
 
 const DROP_ALL: &str = "
@@ -36,6 +37,7 @@ DROP TABLE IF EXISTS files;
 DROP TABLE IF EXISTS chunks;
 DROP TABLE IF EXISTS chunks_fts;
 DROP TABLE IF EXISTS contexts;
+DROP TABLE IF EXISTS skipped;
 ";
 
 /// A stored chunk as search needs it.
@@ -77,7 +79,9 @@ pub(crate) fn set_meta(tx: &Transaction, key: &str, value: &str) -> Result<()> {
 }
 
 pub(crate) fn clear(tx: &Transaction) -> Result<()> {
-    tx.execute_batch("DELETE FROM chunks; DELETE FROM chunks_fts; DELETE FROM files;")?;
+    tx.execute_batch(
+        "DELETE FROM chunks; DELETE FROM chunks_fts; DELETE FROM files; DELETE FROM skipped;",
+    )?;
     Ok(())
 }
 
@@ -221,11 +225,50 @@ pub(crate) fn cache_context(conn: &Connection, key: &str, context: &str) -> Resu
     Ok(())
 }
 
-pub(crate) fn counts(conn: &Connection) -> Result<(i64, i64)> {
+/// Files, chunks and skipped files; `IndexStats` reports all three.
+pub(crate) fn counts(conn: &Connection) -> Result<(i64, i64, i64)> {
     Ok((
         conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0))?,
         conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?,
+        conn.query_row("SELECT count(*) FROM skipped", [], |r| r.get(0))?,
     ))
+}
+
+/// Rewrite the skipped list from this build: files present in the source that did not index,
+/// each with the reason it was skipped. A file that now indexes, or that is gone, drops out.
+pub(crate) fn replace_skipped(tx: &Transaction, skipped: &[(String, String)]) -> Result<()> {
+    tx.execute("DELETE FROM skipped", [])?;
+    let mut stmt = tx.prepare("INSERT INTO skipped(path, reason) VALUES (?1, ?2)")?;
+    for (path, reason) in skipped {
+        stmt.execute(params![path, reason])?;
+    }
+    Ok(())
+}
+
+/// One file's row as `file_statuses` reads it: `(path, indexed, chunks, chars, reason)`.
+type FileStatusRow = (String, bool, i64, i64, Option<String>);
+
+/// Per-file status sorted by path: indexed files carry their chunk count and total body
+/// characters, skipped files carry their reason.
+pub(crate) fn file_statuses(conn: &Connection) -> Result<Vec<FileStatusRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, 1, (SELECT count(*) FROM chunks c WHERE c.path = f.path), \
+                (SELECT COALESCE(SUM(LENGTH(c.body)), 0) FROM chunks c WHERE c.path = f.path), \
+                NULL FROM files f \
+         UNION ALL \
+         SELECT path, 0, 0, 0, reason FROM skipped \
+         ORDER BY 1",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get::<_, i64>(1)? == 1,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn to_blob(v: &[f32]) -> Vec<u8> {
