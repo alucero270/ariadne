@@ -323,9 +323,10 @@ pub(crate) mod tests {
     }
 
     /// Like `fixture`, plus an unreadable `.md` the last build recorded as skipped, and a
-    /// second directory so prefix filters have something to bite on.
+    /// second directory so prefix filters have something to bite on. `None` when the mode
+    /// 000 file is still readable (the tests run as root), like #161's guard.
     #[cfg(unix)]
-    pub fn fixture_with_skipped() -> Fixture {
+    pub fn fixture_with_skipped() -> Option<Fixture> {
         use std::os::unix::fs::PermissionsExt;
         let src = tempfile::tempdir().unwrap();
         fs::create_dir_all(src.path().join("systems/fabrication")).unwrap();
@@ -350,6 +351,10 @@ pub(crate) mod tests {
             fs::Permissions::from_mode(0o0),
         )
         .unwrap();
+        if fs::read(src.path().join("systems/locked.md")).is_ok() {
+            eprintln!("note: mode 000 is still readable (running as root?); skipping test");
+            return None;
+        }
         let db = tempfile::tempdir().unwrap();
         let open = || {
             Index::open(
@@ -362,7 +367,7 @@ pub(crate) mod tests {
         let mut writer = open();
         writer.build().unwrap();
         let app = App::new(open(), writer);
-        Fixture { src, _db: db, app }
+        Some(Fixture { src, _db: db, app })
     }
 
     #[tokio::test]
@@ -395,7 +400,9 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn files_lists_indexed_and_skipped_with_filters() {
-        let f = fixture_with_skipped();
+        let Some(f) = fixture_with_skipped() else {
+            return;
+        };
         let all = f.app.files(None, None, None, None).await.unwrap();
         assert_eq!(all.total, 3);
         let paths: Vec<_> = all.files.iter().map(|x| x.path.as_str()).collect();

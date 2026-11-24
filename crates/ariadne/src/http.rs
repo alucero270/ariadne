@@ -334,7 +334,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn files_route_lists_filters_paginates_and_validates() {
-        let f = crate::app::tests::fixture_with_skipped();
+        let Some(f) = crate::app::tests::fixture_with_skipped() else {
+            return;
+        };
         let router = router(f.app.clone(), Some(TOKEN.into()));
 
         // Token-protected like /search.
