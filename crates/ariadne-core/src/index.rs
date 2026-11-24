@@ -331,10 +331,11 @@ impl Index {
 
         // Read and chunk changed documents. No write lock is held until the last step. A file
         // that cannot be read or extracted is recorded as skipped with a warning, and the build
-        // moves on. Only store and transaction errors fail the build. A file only enters `seen`
-        // once it has been read, so a previously indexed file that has become unreadable falls
-        // out of `seen` and its stale `files` row and chunks are deleted by the gone cleanup
-        // below; the next successful build re-indexes it.
+        // moves on. Only store and transaction errors fail the build. A file enters `seen`
+        // only if it ends up indexed: its hash matches the last build, or its extraction
+        // succeeds. Every skip path leaves it out, so a previously indexed file that now fails
+        // falls out of `seen` and its stale `files` row and chunks are deleted by the gone
+        // cleanup below; the next successful build re-indexes it.
         let mut changed = Vec::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         let mut seen = HashSet::new();
@@ -365,9 +366,10 @@ impl Index {
                     continue;
                 }
             };
-            seen.insert(file.rel.clone());
             let sha = format!("{:x}", Sha256::digest(&raw));
             if known.get(&file.rel) == Some(&sha) {
+                // Unchanged since the last build: it is still indexed, so it is in `seen`.
+                seen.insert(file.rel.clone());
                 continue;
             }
             // Dispatch to the extractor for this file's format, then chunk the document. An
@@ -381,6 +383,8 @@ impl Index {
                     continue;
                 }
             };
+            // Extraction succeeded, so it ends up indexed and enters `seen`.
+            seen.insert(file.rel.clone());
             let chunks = chunk_document(&file.rel, &document, self.source.max_chars);
             let text = String::from_utf8_lossy(&raw).into_owned();
             changed.push(ChangedDocument {
@@ -1700,6 +1704,7 @@ pub(crate) mod tests {
         .unwrap();
         let stats = idx.build().unwrap();
         let files = idx.files().unwrap();
+        assert_no_duplicate_paths(&files);
         // Dispatch: the .fke file went to the fake extractor and is indexed...
         assert!(files
             .iter()
@@ -1724,6 +1729,69 @@ pub(crate) mod tests {
             "ignored after the format change: {files:?}"
         );
         assert_eq!(md_only.stats().unwrap().ignored.get("fke"), Some(&2));
+    }
+
+    /// A previously indexed file changes into content its extractor rejects: it drops out of
+    /// the index and is listed once, as skipped, with its old text gone from search. Fixing the
+    /// content indexes it again.
+    #[test]
+    fn a_previously_indexed_file_whose_extraction_fails_is_skipped_once() {
+        let f = Fixture::new();
+        f.write("thing.fke", "a quickfox hides in the reeds\n");
+        let db = f.db.path().join("i.db");
+        let with_fake = vec![
+            md_format(),
+            Format {
+                id: "fke",
+                extensions: &["fke"],
+                max_bytes: crate::source::MAX_FILE_BYTES,
+                report_oversize: false,
+                extract: fake_extract,
+            },
+        ];
+        let mut idx = Index::open(
+            &db,
+            Source::new(f.src.path()).with_formats(with_fake),
+            Models::default(),
+        )
+        .unwrap();
+
+        // Build 1: it indexes through the test extractor.
+        idx.build().unwrap();
+        let thing = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "thing.fke")
+            .unwrap();
+        assert_eq!(thing.status, FileState::Indexed);
+
+        // Build 2: its content now fails the extractor.
+        f.write("thing.fke", "BOMB should not index\n");
+        let stats = idx.build().unwrap();
+        assert_eq!(stats.files_skipped, 1);
+        // It is listed exactly once, as skipped, and its old text is gone from search.
+        let files = idx.files().unwrap();
+        assert_no_duplicate_paths(&files);
+        let things: Vec<&FileStatus> = files.iter().filter(|x| x.path == "thing.fke").collect();
+        assert_eq!(things.len(), 1, "thing.fke listed once: {files:?}");
+        assert_eq!(things[0].status, FileState::Skipped);
+        assert!(things[0].reason.is_some());
+        assert!(idx
+            .search("quickfox", &opts(Mode::Bm25, 5))
+            .unwrap()
+            .is_empty());
+
+        // Build 3: the content extracts again, so it is indexed once.
+        f.write("thing.fke", "a quickfox hides in the reeds again\n");
+        idx.build().unwrap();
+        let thing = idx
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.path == "thing.fke")
+            .unwrap();
+        assert_eq!(thing.status, FileState::Indexed);
     }
 
     #[test]
