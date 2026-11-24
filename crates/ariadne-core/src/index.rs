@@ -50,8 +50,9 @@ impl Source {
         }
     }
 
-    /// The formats this source reads, replacing the default. An unknown format is an error that
-    /// lists the supported values, so the failure surfaces at startup, not mid-build.
+    /// The formats this source reads, replacing the default. The list comes from
+    /// [`enabled_formats`], where an unknown format is a startup error that lists the supported
+    /// values; this function only stores the list it is given.
     pub fn with_formats(self, formats: Vec<Format>) -> Self {
         Self { formats, ..self }
     }
@@ -1722,7 +1723,13 @@ pub(crate) mod tests {
             Models::default(),
         )
         .unwrap();
-        md_only.build().unwrap();
+        let stats = md_only.build().unwrap();
+        // The format change is a settings change, so the two markdown files are re-processed
+        // even though their text is unchanged.
+        assert_eq!(
+            stats.files_changed, 2,
+            "a format change re-processes the source: {stats:?}"
+        );
         let files = md_only.files().unwrap();
         assert!(
             !files.iter().any(|x| x.path == "thing.fke"),
@@ -1794,12 +1801,25 @@ pub(crate) mod tests {
         assert_eq!(thing.status, FileState::Indexed);
     }
 
+    /// The format list is order-free: `md,epub` and `epub,md` carry the same signature, so
+    /// switching between them is not a format change and triggers no rebuild.
     #[test]
-    fn a_unknown_format_is_a_startup_error_that_lists_the_supported_values() {
-        assert!(enabled_formats("md").is_ok());
-        let err = enabled_formats("docx").unwrap_err().to_string();
-        assert!(err.contains("unknown format docx"), "{err}");
-        assert!(err.contains("md"), "supported values listed: {err}");
+    fn the_format_list_is_order_free() {
+        let f = Fixture::new();
+        let db = f.db.path().join("i.db");
+        let a = Source::new(f.src.path()).with_formats(enabled_formats("md,epub").unwrap());
+        let b = Source::new(f.src.path()).with_formats(enabled_formats("epub,md").unwrap());
+        assert_eq!(a.formats_signature(), b.formats_signature());
+        let mut idx = Index::open(&db, a, Models::default()).unwrap();
+        idx.build().unwrap();
+        drop(idx);
+        let mut idx = Index::open(&db, b, Models::default()).unwrap();
+        // The signature is unchanged, so nothing is re-processed: a full rebuild would give 2.
+        let stats = idx.build().unwrap();
+        assert_eq!(
+            stats.files_changed, 0,
+            "reordering the formats must not rebuild: {stats:?}"
+        );
     }
 
     // EPUB (#153): enabling the format indexes books beside the markdown; the default formats

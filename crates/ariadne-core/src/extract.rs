@@ -4,8 +4,8 @@
 //! registered extractors.
 
 use crate::chunk::{markdown_document, Document};
+use crate::source::extension_of;
 use anyhow::{bail, Result};
-use std::path::Path;
 
 /// One format an index can read: its id, the extensions it covers, the largest file it can
 /// read, how an oversized file is handled, and the extractor that turns a matching file into a
@@ -114,11 +114,7 @@ fn collapse_blank_lines(text: &str) -> String {
 
 /// The format covering a path's extension, if any enabled format covers it.
 pub(crate) fn covering_format(formats: &[Format], path: &str) -> Option<Format> {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = extension_of(path).unwrap_or_default();
     formats
         .iter()
         .find(|f| f.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)))
@@ -128,11 +124,7 @@ pub(crate) fn covering_format(formats: &[Format], path: &str) -> Option<Format> 
 /// Turn one file's bytes into a [`Document`], dispatching on its extension. A file whose
 /// extension is covered by none of `formats` is an error: it belongs to no enabled format.
 pub fn extract(path: &str, bytes: &[u8], formats: &[Format]) -> Result<Document> {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = extension_of(path).unwrap_or_default();
     for format in formats {
         if format
             .extensions
@@ -146,8 +138,9 @@ pub fn extract(path: &str, bytes: &[u8], formats: &[Format]) -> Result<Document>
 }
 
 /// Parse the `--formats` / `ARIADNE_FORMATS` value (a comma-separated list) into the matching
-/// formats, defaulting to markdown. An unknown value is a startup error that lists the supported
-/// values.
+/// formats, defaulting to markdown. The result is sorted and deduped, so the order of the
+/// list and repeated names do not matter. An unknown value is a startup error that lists the
+/// supported values.
 pub fn enabled_formats(value: &str) -> Result<Vec<Format>> {
     let all = formats();
     let tokens: Vec<&str> = value
@@ -155,11 +148,15 @@ pub fn enabled_formats(value: &str) -> Result<Vec<Format>> {
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
         .collect();
-    let picked: Vec<&str> = if tokens.is_empty() {
+    // Sort and dedupe before looking the formats up: `md,epub`, `epub,md` and `md,md` all give
+    // the same list, so the source's format signature is order-free.
+    let mut picked: Vec<&str> = if tokens.is_empty() {
         vec!["md"]
     } else {
         tokens
     };
+    picked.sort_unstable();
+    picked.dedup();
     let mut out = Vec::new();
     for id in picked {
         match all.iter().find(|f| f.id == id) {
@@ -218,6 +215,17 @@ mod tests {
             formats.iter().map(|f| f.id).collect::<Vec<_>>(),
             vec!["epub"]
         );
+    }
+
+    /// The enabled list is sorted and deduped: the order of the input does not matter, and a
+    /// repeated format is listed once.
+    #[test]
+    fn the_enabled_formats_are_sorted_and_deduped() {
+        let ids = |fs: &[Format]| fs.iter().map(|f| f.id).collect::<Vec<_>>();
+        let a = enabled_formats("md,epub").unwrap();
+        let b = enabled_formats("epub,md").unwrap();
+        assert_eq!(ids(&a), ids(&b), "the order of the list does not matter");
+        assert_eq!(ids(&enabled_formats("md,md").unwrap()), vec!["md"]);
     }
 
     #[test]

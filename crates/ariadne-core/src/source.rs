@@ -130,9 +130,14 @@ pub fn walk_sources(
     Ok(out)
 }
 
-/// The lower-cased extension of `rel` without the dot, if it has one.
-fn extension_of(rel: &str) -> Option<String> {
-    rel.rsplit('.').next().map(|e| e.to_ascii_lowercase())
+/// The lower-cased extension of `rel` without the dot, if the file name has one. A dotted
+/// folder is not an extension (`docs/v1.2/README` has none), and a file name without a dot
+/// (`Makefile`) has none either.
+pub(crate) fn extension_of(rel: &str) -> Option<String> {
+    Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
 }
 
 /// Whether `format` covers a file with the given extension.
@@ -228,6 +233,38 @@ mod tests {
         assert_eq!(rels, ["README.md", "docs/sub/a.md"]);
         // The disabled-extension file is counted, not indexed.
         assert_eq!(ignored.get("txt"), Some(&1));
+    }
+
+    /// A dotted folder is not an extension, and a file name without a dot has none: the walk
+    /// counts only files with a real extension and invents no keys for the rest.
+    #[test]
+    fn files_without_an_extension_are_not_counted_in_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join("docs/v1.2")).unwrap();
+        fs::write(root.join("Makefile"), "all:\n").unwrap();
+        fs::write(root.join("docs/v1.2/README"), "notes").unwrap();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        let md: &mut [Format] = &mut [Format {
+            id: "md",
+            extensions: &["md"],
+            max_bytes: MAX_FILE_BYTES,
+            report_oversize: false,
+            extract: crate::extract::markdown,
+        }];
+        let mut ignored = BTreeMap::new();
+        let rels = walk_sources(&root, &defaults(), md, &mut ignored)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.rel)
+            .collect::<Vec<_>>();
+        assert!(
+            rels.is_empty(),
+            "no enabled format covers any of the files: {rels:?}"
+        );
+        let mut expected: BTreeMap<String, usize> = BTreeMap::new();
+        expected.insert("txt".to_string(), 1);
+        assert_eq!(ignored, expected);
     }
 
     /// Creating a symlink needs a privilege Windows does not always grant, so the symlink cases
