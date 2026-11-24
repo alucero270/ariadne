@@ -101,21 +101,26 @@ pub fn epub(path: &str, bytes: &[u8]) -> Result<Document> {
 
     drm_check(&mut zip, &opf, &opf_dir, &opf_path)?;
 
-    // Chapter titles: the EPUB 3 nav document when present, else the EPUB 2 NCX. Chapters the
-    // table of contents does not name fall back to their own headings.
+    // Chapter titles: the EPUB 3 nav document when it names chapters, else the EPUB 2 NCX.
+    // Chapters the table of contents does not name fall back to their own headings.
     let nav = opf
         .items
         .iter()
         .find(|item| item.properties.iter().any(|p| p == "nav"));
-    let titles = match nav {
+    let mut titles = match nav {
         Some(item) => {
             let nav_path = resolve(&opf_dir, &item.href);
             read_entry(&mut zip, &nav_path)
                 .map(|bytes| nav_titles(&bytes, &parent_dir(&nav_path)))
                 .unwrap_or_default()
         }
-        None => ncx_titles(&mut zip, &opf, &opf_dir),
+        None => HashMap::new(),
     };
+    // A nav document that names no chapter (no toc nav, or a toc with no links) must not
+    // stand in for the NCX: fall back to the NCX for the titles.
+    if titles.is_empty() {
+        titles = ncx_titles(&mut zip, &opf, &opf_dir);
+    }
 
     let book_title = opf
         .title
@@ -419,7 +424,12 @@ fn nav_titles(bytes: &[u8], base_dir: &str) -> HashMap<String, String> {
         match event {
             Event::Eof => break,
             Event::Start(e) if e.local_name().as_ref() == b"nav" => {
-                toc_navs.push(attr(&e, b"type").as_deref() == Some("toc"));
+                // The EPUB 3 type attribute is a whitespace-separated list, so `toc` may
+                // share the list with other types such as `landmarks`.
+                let is_toc = attr(&e, b"type")
+                    .as_deref()
+                    .is_some_and(|t| t.split_whitespace().any(|t| t == "toc"));
+                toc_navs.push(is_toc);
             }
             Event::Start(e)
                 if e.local_name().as_ref() == b"a" && toc_navs.last() == Some(&true) =>
@@ -1190,6 +1200,96 @@ pub mod fixtures {
         ])
     }
 
+    /// A nav document whose only nav carries the valid EPUB 3 type list `toc landmarks`,
+    /// with labels that differ from the chapters' own headings.
+    pub const NAV_TOC_LANDMARKS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Contents</title></head>
+<body>
+<nav epub:type="toc landmarks">
+  <ol>
+    <li><a href="text/c1.xhtml">Chapter One</a></li>
+    <li><a href="text/c5.xhtml#replication">Chapter Five</a></li>
+  </ol>
+</nav>
+</body>
+</html>
+"#;
+
+    /// EPUB 3 whose nav document types the table of contents as `toc landmarks`, a
+    /// whitespace-separated type list.
+    pub fn epub3_toc_landmarks_nav() -> Vec<u8> {
+        let opf = opf3(
+            ITEMS,
+            "    <itemref idref=\"c5\"/>\n    <itemref idref=\"c1\"/>\n",
+        );
+        archive(&[
+            ("mimetype", b"application/epub+zip"),
+            entry("META-INF/container.xml", CONTAINER),
+            entry("OEBPS/content.opf", &opf),
+            entry("OEBPS/text/c1.xhtml", C1),
+            entry("OEBPS/text/c5.xhtml", C5),
+            entry("OEBPS/nav.xhtml", NAV_TOC_LANDMARKS),
+        ])
+    }
+
+    /// A nav document carrying only a landmarks nav, which may not name a chapter.
+    pub const NAV_LANDMARKS_ONLY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Contents</title></head>
+<body>
+<nav epub:type="landmarks">
+  <ol>
+    <li><a href="text/c1.xhtml">Chapter</a></li>
+  </ol>
+</nav>
+</body>
+</html>
+"#;
+
+    /// An NCX whose labels differ from the chapters' own headings, so a test can tell the
+    /// NCX titles apart from the heading fallback.
+    pub const NCX_RENAMED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<head><meta name="dtb:uid" content="urn:uuid:made-up"/></head>
+<docTitle><text>Replication Basics</text></docTitle>
+<navMap>
+  <navPoint id="n1" playOrder="1">
+    <navLabel><text>First chapter</text></navLabel>
+    <content src="text/c1.xhtml"/>
+  </navPoint>
+  <navPoint id="n2" playOrder="2">
+    <navLabel><text>Calibration chapter</text></navLabel>
+    <content src="text/c5.xhtml"/>
+  </navPoint>
+</navMap>
+</ncx>
+"#;
+
+    /// EPUB 3 whose nav document has only a landmarks nav, plus a good NCX: the chapter
+    /// titles must come from the NCX.
+    pub fn landmarks_only_nav_with_ncx() -> Vec<u8> {
+        let items = concat!(
+            "    <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n",
+            "    <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n",
+            "    <item id=\"c1\" href=\"text/c1.xhtml\" media-type=\"application/xhtml+xml\"/>\n",
+            "    <item id=\"c5\" href=\"text/c5.xhtml\" media-type=\"application/xhtml+xml\"/>\n",
+        );
+        let opf = opf3(
+            items,
+            "    <itemref idref=\"c5\"/>\n    <itemref idref=\"c1\"/>\n",
+        );
+        archive(&[
+            ("mimetype", b"application/epub+zip"),
+            entry("META-INF/container.xml", CONTAINER),
+            entry("OEBPS/content.opf", &opf),
+            entry("OEBPS/text/c1.xhtml", C1),
+            entry("OEBPS/text/c5.xhtml", C5),
+            entry("OEBPS/nav.xhtml", NAV_LANDMARKS_ONLY),
+            entry("OEBPS/toc.ncx", NCX_RENAMED),
+        ])
+    }
+
     /// The spine lists chapter 5 twice: the book must still read it once.
     pub fn spine_lists_a_chapter_twice() -> Vec<u8> {
         let opf = opf3(
@@ -1340,6 +1440,36 @@ mod tests {
                 "Chapter 5 Replication > Belt tension",
                 "Chapter 1 Setup",
                 "Chapter 1 Setup > Power",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nav_typed_toc_landmarks_still_titles_the_chapters() {
+        let doc = epub("book.epub", &epub3_toc_landmarks_nav()).unwrap();
+        // The labels differ from the chapters' own h1s, so only the nav can supply them.
+        assert_eq!(
+            trails(&doc),
+            [
+                "Chapter Five > Chapter 5 Replication",
+                "Chapter Five > Chapter 5 Replication > Belt tension",
+                "Chapter One > Chapter 1 Setup",
+                "Chapter One > Chapter 1 Setup > Power",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_landmarks_only_nav_falls_back_to_the_ncx_titles() {
+        let doc = epub("book.epub", &landmarks_only_nav_with_ncx()).unwrap();
+        // The landmarks nav may not name a chapter; the NCX labels win over the h1s.
+        assert_eq!(
+            trails(&doc),
+            [
+                "Calibration chapter > Chapter 5 Replication",
+                "Calibration chapter > Chapter 5 Replication > Belt tension",
+                "First chapter > Chapter 1 Setup",
+                "First chapter > Chapter 1 Setup > Power",
             ]
         );
     }
