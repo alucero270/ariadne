@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# The made-up EPUB fixtures ship only for tests: the crate's own test harness, or a
+# dependent's dev-dependencies enabling this feature (see crates/ariadne).
+test-fixtures = []
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true

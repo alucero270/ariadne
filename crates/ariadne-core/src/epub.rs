@@ -84,13 +84,17 @@ pub fn epub(path: &str, bytes: &[u8]) -> Result<Document> {
     let opf = parse_opf(&opf_bytes)?;
     let opf_dir = parent_dir(&opf_path);
 
-    // The spine is the reading order, which need not be the file order.
-    let spine: Vec<String> = opf
-        .spine
-        .iter()
-        .filter_map(|id| opf.items.iter().find(|item| &item.id == id))
-        .map(|item| resolve(&opf_dir, &item.href))
-        .collect();
+    // The spine is the reading order, which need not be the file order. It may list the same
+    // document more than once; each document is read once, in first-seen order.
+    let mut spine: Vec<String> = Vec::new();
+    for id in &opf.spine {
+        if let Some(item) = opf.items.iter().find(|item| &item.id == id) {
+            let doc = resolve(&opf_dir, &item.href);
+            if !spine.contains(&doc) {
+                spine.push(doc);
+            }
+        }
+    }
     if spine.is_empty() {
         bail!("the OPF spine references no manifest items");
     }
@@ -393,7 +397,8 @@ fn ncx_navmap(bytes: &[u8], base_dir: &str) -> HashMap<String, String> {
     out
 }
 
-/// The EPUB 3 nav document: every `<nav> ... <a href>` pair.
+/// The EPUB 3 nav document: the links inside the `<nav epub:type="toc">` only. A landmarks
+/// or page-list nav may share the document, but neither may name a chapter.
 fn nav_titles(bytes: &[u8], base_dir: &str) -> HashMap<String, String> {
     let text = match std::str::from_utf8(bytes) {
         Ok(text) => text,
@@ -402,7 +407,8 @@ fn nav_titles(bytes: &[u8], base_dir: &str) -> HashMap<String, String> {
     let mut reader = Reader::from_str(text);
     reader.config_mut().check_end_names = false;
     let mut out = HashMap::new();
-    let mut nav_depth = 0usize;
+    // One entry per open <nav>; true only for the epub:type="toc" table of contents.
+    let mut toc_navs: Vec<bool> = Vec::new();
     let mut href: Option<String> = None;
     let mut label = String::new();
     loop {
@@ -412,16 +418,22 @@ fn nav_titles(bytes: &[u8], base_dir: &str) -> HashMap<String, String> {
         };
         match event {
             Event::Eof => break,
-            Event::Start(e) if e.local_name().as_ref() == b"nav" => nav_depth += 1,
-            Event::Start(e) if nav_depth > 0 && e.local_name().as_ref() == b"a" => {
+            Event::Start(e) if e.local_name().as_ref() == b"nav" => {
+                toc_navs.push(attr(&e, b"type").as_deref() == Some("toc"));
+            }
+            Event::Start(e)
+                if e.local_name().as_ref() == b"a" && toc_navs.last() == Some(&true) =>
+            {
                 href = attr(&e, b"href");
                 label.clear();
             }
             Event::Text(e) if href.is_some() => {
                 label.push_str(&String::from_utf8_lossy(e.as_ref()));
             }
-            Event::End(e) if e.local_name().as_ref() == b"nav" => nav_depth -= 1,
-            Event::End(e) if nav_depth > 0 && e.local_name().as_ref() == b"a" => {
+            Event::End(e) if e.local_name().as_ref() == b"nav" => {
+                toc_navs.pop();
+            }
+            Event::End(e) if e.local_name().as_ref() == b"a" && toc_navs.last() == Some(&true) => {
                 if let Some(href) = href.take() {
                     let label = unescape(&collapse(&label));
                     if !href.is_empty() && !label.is_empty() {
@@ -821,6 +833,7 @@ fn file_stem(path: &str) -> String {
 /// Small made-up EPUB fixtures, used by tests: archives built with the zip writer. Nothing
 /// here is third-party content; every book is fictional and every path is invented. They are
 /// public so tests in other crates can index a book too.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub mod fixtures {
     use std::io::{Cursor, Write};
     use std::path::Path;
@@ -1139,6 +1152,75 @@ pub mod fixtures {
         archive(&borrowed)
     }
 
+    /// A nav document whose page list comes before the table of contents. The page list
+    /// links the same chapters with page numbers as labels; only the toc may name them.
+    pub const NAV_PAGE_LIST_FIRST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Contents</title></head>
+<body>
+<nav epub:type="page-list">
+  <ol>
+    <li><a href="text/c1.xhtml">12</a></li>
+    <li><a href="text/c5.xhtml">15</a></li>
+  </ol>
+</nav>
+<nav epub:type="toc">
+  <ol>
+    <li><a href="text/c1.xhtml">Chapter 1 Setup</a></li>
+    <li><a href="text/c5.xhtml#replication">Chapter 5 Replication</a></li>
+  </ol>
+</nav>
+</body>
+</html>
+"#;
+
+    /// EPUB 3 whose nav document puts a page list before the toc.
+    pub fn page_list_before_toc() -> Vec<u8> {
+        let opf = opf3(
+            ITEMS,
+            "    <itemref idref=\"c5\"/>\n    <itemref idref=\"c1\"/>\n",
+        );
+        archive(&[
+            ("mimetype", b"application/epub+zip"),
+            entry("META-INF/container.xml", CONTAINER),
+            entry("OEBPS/content.opf", &opf),
+            entry("OEBPS/text/c1.xhtml", C1),
+            entry("OEBPS/text/c5.xhtml", C5),
+            entry("OEBPS/nav.xhtml", NAV_PAGE_LIST_FIRST),
+        ])
+    }
+
+    /// The spine lists chapter 5 twice: the book must still read it once.
+    pub fn spine_lists_a_chapter_twice() -> Vec<u8> {
+        let opf = opf3(
+            ITEMS,
+            "    <itemref idref=\"c5\"/>\n    <itemref idref=\"c5\"/>\n    <itemref idref=\"c1\"/>\n",
+        );
+        archive(&[
+            ("mimetype", b"application/epub+zip"),
+            entry("META-INF/container.xml", CONTAINER),
+            entry("OEBPS/content.opf", &opf),
+            entry("OEBPS/text/c1.xhtml", C1),
+            entry("OEBPS/text/c5.xhtml", C5),
+            entry("OEBPS/nav.xhtml", NAV),
+        ])
+    }
+
+    /// An archive whose entries declare a total uncompressed size past the limit: one
+    /// 600 MiB file. The zeros are streamed to the writer in 1 MiB chunks, so neither the
+    /// fixture nor the test holds the whole book in memory, and the compressed archive
+    /// stays tiny.
+    pub fn over_the_expanded_limit() -> Vec<u8> {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        zip.start_file("big.dat", options).unwrap();
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..600 {
+            zip.write_all(&chunk).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
     /// Write one of these archives into a source tree under `rel` (creating folders).
     pub fn write_epub(root: &Path, rel: &str, bytes: &[u8]) {
         let path = root.join(rel);
@@ -1237,6 +1319,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("over 10,000 zip entries"), "{err}");
+    }
+
+    #[test]
+    fn an_archive_past_the_expanded_limit_is_refused() {
+        let err = epub("book.epub", &over_the_expanded_limit())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expands past the 500 MB limit"), "{err}");
+    }
+
+    #[test]
+    fn a_page_list_before_the_toc_cannot_name_chapters() {
+        let doc = epub("book.epub", &page_list_before_toc()).unwrap();
+        // The page list links the same chapters with page numbers; the toc still wins.
+        assert_eq!(
+            trails(&doc),
+            [
+                "Chapter 5 Replication",
+                "Chapter 5 Replication > Belt tension",
+                "Chapter 1 Setup",
+                "Chapter 1 Setup > Power",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_spine_listing_a_chapter_twice_reads_it_once() {
+        let doc = epub("book.epub", &spine_lists_a_chapter_twice()).unwrap();
+        assert_eq!(
+            trails(&doc),
+            [
+                "Chapter 5 Replication",
+                "Chapter 5 Replication > Belt tension",
+                "Chapter 1 Setup",
+                "Chapter 1 Setup > Power",
+            ]
+        );
+        let times = doc
+            .sections
+            .iter()
+            .filter(|s| s.body.contains("Print a calibration cube first."))
+            .count();
+        assert_eq!(times, 1, "the duplicated chapter must appear once");
     }
 
     #[test]
