@@ -101,7 +101,7 @@ fn tools() -> Value {
         },
         {
             "name": "list_documents",
-            "description": "List the files in the index with each one's status, to answer 'what is indexed, and what failed to index and why?'. Filter by status (indexed or skipped) and/or a path prefix; paginate with limit (default 200, capped at 1000) and offset. Skipped files carry the reason they were left out.",
+            "description": "List the files in the index with each one's status, to answer 'what is indexed, and what failed to index and why?'. Filter by status (indexed or skipped) and/or by prefix, a plain string prefix of the path, so `systems` also matches `systems-old/...`. Paginate with limit (default 200, capped at 1000) and offset. Skipped files carry the reason they were left out.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -165,11 +165,20 @@ async fn read_document(app: &Arc<App>, args: &Value) -> Result<String, AppError>
 }
 
 async fn list_documents(app: &Arc<App>, args: &Value) -> Result<String, AppError> {
-    let status = match args["status"].as_str() {
-        None => None,
-        Some(v) => Some(parse_file_status(v)?),
+    let status = match &args["status"] {
+        Value::Null => None,
+        v => Some(parse_file_status(v.as_str().ok_or_else(|| {
+            AppError::BadRequest("status must be a string".into())
+        })?)?),
     };
-    let prefix = args["prefix"].as_str().map(str::to_string);
+    let prefix = match &args["prefix"] {
+        Value::Null => None,
+        v => Some(
+            v.as_str()
+                .ok_or_else(|| AppError::BadRequest("prefix must be a string".into()))?
+                .to_string(),
+        ),
+    };
     let limit = match &args["limit"] {
         Value::Null => None,
         v => Some(
@@ -368,7 +377,9 @@ mod tests {
     #[tokio::test]
     async fn list_documents_lists_filters_and_reports_mistakes_as_errors() {
         use crate::app::tests::fixture_with_skipped;
-        let f = fixture_with_skipped();
+        let Some(f) = fixture_with_skipped() else {
+            return;
+        };
 
         // The tool is listed alongside search and read_document.
         let (_, list) = rpc(
@@ -383,6 +394,17 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, ["search", "read_document", "list_documents"]);
+
+        // The description says how the prefix filter matches.
+        let desc = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "list_documents")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("string prefix of the path"), "{desc}");
 
         // A call returns the same rows the HTTP /files route does.
         let (_, rows) = rpc(&f.app, call(2, "list_documents", json!({}))).await;
@@ -417,6 +439,15 @@ mod tests {
         // A bad argument is a tool error, not a crash.
         let (_, bad) = rpc(&f.app, call(4, "list_documents", json!({"status":"bogus"}))).await;
         assert_eq!(bad["result"]["isError"], true, "{bad}");
+
+        // A wrong JSON type is a tool error, not a silently absent filter.
+        for bad in [json!({"status": 5}), json!({"prefix": 5})] {
+            let arg = bad.to_string();
+            let (_, r) = rpc(&f.app, call(5, "list_documents", bad)).await;
+            assert_eq!(r["result"]["isError"], true, "{arg}");
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("must be a string"), "{text}");
+        }
     }
 
     #[tokio::test]
