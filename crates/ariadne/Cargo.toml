@@ -15,6 +15,7 @@ ureq = { version = "2", features = ["json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 
 [dev-dependencies]
+ariadne-core = { path = "../ariadne-core", features = ["test-fixtures"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
